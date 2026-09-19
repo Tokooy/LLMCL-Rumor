@@ -1,7 +1,5 @@
 # LLMCL-Rumor
 
-**基于 LLM 增强对比学习的社交网络虚假信息检测** —— 论文方法的代码复现。
-
 > 复现对象：《基于LLM增强对比学习的社交网络虚假信息检测方法》(2025-01-22)
 > 代码起点：开源项目 `Bert-TextClassification-master`（BERT 文本分类基线），
 > 本仓库在其基础上按论文方法重构为标准的深度学习项目结构。
@@ -10,23 +8,7 @@
 
 ---
 
-## 1. 论文方法一句话概括
-
-用 **LLM 做数据增强**（生成语义一致、表达多样的样本）→ 喂给 **BERT + MLP 投影头的对比学习网络**
-（InfoNCE 拉近"原样本 ↔ 其增强样本"）→ 再用 **CL 的对比损失反过来指导 LLM 微调与合并**
-（LoRA + TIES-Merging），形成"增强 → 训练 → 反馈 → 再增强"的闭环。
-
-三个阶段与论文 §3 的对应关系：
-
-| 论文阶段 | 本仓库实现位置 |
-|---|---|
-| 3.1 数据预处理与 Prompt 编排 | `data/processors/` + `src/llm/prompts.py` |
-| 3.2 LLM 辅助的特征提取与标签预测 | `src/models/` + `src/training/losses.py` |
-| 3.3 LLM 与 CL 网络的对齐（Algorithm 1 & 2） | `src/llm/ties_merge.py` + `src/training/joint_trainer.py` |
-
----
-
-## 2. 目录结构与各子文件夹用途
+## 1. 目录结构与各子文件夹用途
 
 ```
 LLMCL-Rumor/
@@ -49,7 +31,7 @@ LLMCL-Rumor/
 > 这样仓库根目录只剩下"标准深度学习项目"该有的目录，
 > 参考代码被明确隔离在 `reference/` 下，不会再与主流程混淆。
 
-### 2.1 `configs/` —— 配置
+### 1.1 `configs/` —— 配置
 
 | 文件 | 用途 |
 |---|---|
@@ -63,7 +45,7 @@ LLMCL-Rumor/
 配置支持 `defaults:` 继承链，例如 `proposed-4.yaml → llm/qwen7b.yaml → base.yaml`。
 加载后可用属性访问：`cfg.training.alignment.max_finetune_rounds`。
 
-### 2.2 `data/` —— 数据
+### 1.2 `data/` —— 数据
 
 | 路径 | 用途 |
 |---|---|
@@ -74,7 +56,7 @@ LLMCL-Rumor/
 | `processors/reply_flatten.py` | 回复树的展平与截断（BFS/DFS），生成编码器输入文本 |
 | `dataset.py` | PyTorch `Dataset`：成对返回（原样本, 增强样本）供对比学习使用 |
 
-### 2.3 `src/models/` —— 对比学习网络（论文 §3.2）
+### 1.3 `src/models/` —— 对比学习网络（论文 §3.2）
 
 | 文件 | 用途 |
 |---|---|
@@ -89,7 +71,7 @@ LLMCL-Rumor/
 > `reference/baseline/`（原项目快照，只读）。要做"换池化方式"的消融时，
 > 把对应文件复制进来并在 `cl_model.ContrastiveModel` 里替换池化方式即可。
 
-### 2.4 `src/llm/` —— LLM 侧（论文 §3.1 与 §3.3）
+### 1.4 `src/llm/` —— LLM 侧（论文 §3.1 与 §3.3）
 
 | 文件 | 用途 |
 |---|---|
@@ -104,7 +86,7 @@ LLMCL-Rumor/
 | `task_vector.py` | 任务向量 `τ = θ_ft - θ_base` 的表示与运算 |
 | `ties_merge.py` | **Algorithm 1**：Trim → Elect Sign → Disjoint Merge → 合并回基座 |
 
-### 2.5 `src/training/` —— 训练与评估
+### 1.5 `src/training/` —— 训练与评估
 
 | 文件 | 用途 |
 |---|---|
@@ -115,7 +97,7 @@ LLMCL-Rumor/
 | `visualize.py` | t-SNE 特征分布图，对应论文 Fg.7–Fg.10 |
 | `cl_trainer.py` | 单个增强轮次内的 CL 训练与验证（含优化器与学习率调度） |
 
-### 2.6 `scripts/` —— 入口
+### 1.6 `scripts/` —— 入口
 
 | 脚本 | 作用 |
 |---|---|
@@ -129,7 +111,7 @@ LLMCL-Rumor/
 | `check_static.py` | AST 静态一致性自检（`__all__` 覆盖 / 疑似漏 import / 顶层重名 / 跨模块导入） |
 | `check_tracked.py` | 仓库完整性自检（源码是否都被 git 追踪、是否被 gitignore 误伤） |
 
-### 2.7 `reference/` —— 原开源项目快照
+### 1.7 `reference/` —— 原开源项目快照
 
 | 路径 | 用途 |
 |---|---|
@@ -141,7 +123,7 @@ LLMCL-Rumor/
 
 ---
 
-## 3. 快速开始
+## 2. 快速开始
 
 > ⚠️ 本仓库交付时**未运行过任何训练或数据增强**（按需求约定），
 > 请先按下面的顺序自检，再开始正式训练。
@@ -175,7 +157,7 @@ python scripts/evaluate.py    --config configs/experiments/proposed-5.yaml \
 
 ---
 
-## 4. 文档索引
+## 3. 文档索引
 
 | 文档 | 内容 |
 |---|---|
@@ -185,23 +167,3 @@ python scripts/evaluate.py    --config configs/experiments/proposed-5.yaml \
 | `docs/differences_from_baseline.md` | 与原开源项目的差异（含 `pytorch_pretrained_bert → transformers` 迁移说明） |
 | `docs/implementation_notes.md` | 论文未明确处的实现选择与依据（λ 的定义、Proposed-6 的 M 值等） |
 | `docs/reproduction_checklist.md` | 复现论文 Table 3–8 的操作清单 |
-
----
-
-## 5. 引用
-
-```bibtex
-@article{llmcl_rumor_2025,
-  title  = {基于LLM增强对比学习的社交网络虚假信息检测方法},
-  year   = {2025}
-}
-```
-
-依赖的关键方法：
-
-- InfoNCE / 对比学习：[Hadsell et al. 2006](https://www.cs.toronto.edu/~hinton/absps/pami.pdf)（文献[33]）、
-  [He et al. 2020, MoCo](https://arxiv.org/abs/1911.05722)（文献[34]）
-- TIES-Merging（Algorithm 1 的算法原型）：[Yadav et al. 2024](https://arxiv.org/abs/2306.01708)（文献[35]）
-- LoRA：[Hu et al. 2021](https://arxiv.org/abs/2106.09685)（文献[31]）
-- Qwen：[Bai et al. 2023](https://arxiv.org/abs/2309.16609)（文献[36]）
-# LLMCL-Rumor
