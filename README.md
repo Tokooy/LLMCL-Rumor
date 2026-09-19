@@ -3,7 +3,7 @@
 > 复现对象：《基于LLM增强对比学习的社交网络虚假信息检测方法》(2025-01-22)
 > 代码起点：开源项目 `Bert-TextClassification-master`（BERT 文本分类基线），
 > 本仓库在其基础上按论文方法重构为标准的深度学习项目结构。
-> 原项目代码已完整保留在 `reference/baseline/`（只读快照），
+> 原项目代码已完整保留在 `reference/baseline/`，
 > 改造范围的逐项对照见 `docs/differences_from_baseline.md`。
 
 ---
