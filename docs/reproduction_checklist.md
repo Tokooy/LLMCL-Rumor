@@ -20,6 +20,11 @@ pip install -r requirements.txt
 | `pytest tests -q` | 全部通过（无 torch 环境下 torch 用例显示 skipped） |
 | `python scripts/check_syntax.py` | 所有 `.py` 文件通过 |
 | `python scripts/check_static.py` | 0 条提示 |
+| `python scripts/check_tracked.py` | 无被 gitignore 误伤的源码、无未追踪文件 |
+
+> 第三项自检是针对"源码被 `.gitignore` 静默吞掉"的防呆——本项目开发期间就踩过一次
+> （`models/` 模式连 `src/models/` 一起忽略了）。改完 `.gitignore` 或新增目录后
+> 建议跑一次，确认远端不会缺文件。
 
 ---
 

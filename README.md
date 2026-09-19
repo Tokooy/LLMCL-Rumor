@@ -118,6 +118,9 @@ LLMCL-Rumor/
 | `train_cl.py` | 单轮次对比学习训练（对应 Proposed-1/2/3，M=0） |
 | `joint_align.py` | 完整对齐流程（对应 Proposed-4/5/6，M>0） |
 | `evaluate.py` | 加载 checkpoint 评测并导出指标 / t-SNE 图 |
+| `check_syntax.py` | AST 语法自检（不导入任何依赖） |
+| `check_static.py` | AST 静态一致性自检（`__all__` 覆盖 / 疑似漏 import / 顶层重名） |
+| `check_tracked.py` | 仓库完整性自检（源码是否都被 git 追踪、是否被 gitignore 误伤） |
 
 ### 2.7 `reference/` —— 原开源项目快照
 
