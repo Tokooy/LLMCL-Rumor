@@ -144,9 +144,11 @@ LLMCL-Rumor/
 conda create -n llmcl python=3.10 -y && conda activate llmcl
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
+pip install -e .          # 可选但推荐：让 src/ 与 data/ 在任意目录都能 import
 
 # 1) 自检（纯 CPU，不需要模型权重和数据）
 pytest tests -q
+python scripts/check_syntax.py && python scripts/check_static.py && python scripts/check_tracked.py
 
 # 2) 数据准备（把 Twitter15/16 放到 data/raw/twitter15/ 后执行）
 python scripts/prepare_data.py --config configs/base.yaml --dataset twitter15

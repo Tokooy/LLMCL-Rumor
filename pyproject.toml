@@ -1,0 +1,71 @@
+# ===================================================================== #
+# LLMCL-Rumor 打包配置
+# --------------------------------------------------------------------- #
+# 为什么需要这个文件：
+#
+# 源码分成 `src/` 与 `data/` 两个顶层包，脚本里用 `from src.llm import ...`、
+# `from data.processors import ...` 这种"以仓库根为基准"的绝对导入。
+# 直接跑脚本没问题（scripts/*.py 会把仓库根插进 sys.path），
+# 但从别的目录导入、或在 IDE / notebook 里使用时就会 ModuleNotFoundError。
+#
+# 装一次可编辑包即可解决（推荐）：
+#
+#     pip install -e .
+#
+# 装完后任意目录都能 `import src.models` / `import data.processors`，
+# 且改动源码立即生效，不需要重装。
+#
+# 注意：模型权重、数据集与 outputs/ 都不属于包内容，不会被安装。
+# ===================================================================== #
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmcl-rumor"
+version = "0.1.0"
+description = "基于 LLM 增强对比学习的社交网络虚假信息检测方法（论文复现）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["rumor-detection", "contrastive-learning", "llm", "data-augmentation", "model-merging"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# 依赖清单以 requirements.txt 为准（含安装顺序说明），这里只做声明，
+# 且**不写** torch，避免 pip 从 PyPI 装到与 CUDA 不匹配的 CPU 版本。
+dependencies = [
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+# 完整训练依赖：先按官网命令装 torch，再执行 pip install -e ".[full]"
+full = [
+    "transformers>=4.40.0",
+    "tokenizers>=0.19.0",
+    "sentencepiece>=0.1.99",
+    "accelerate>=0.30.0",
+    "peft>=0.10.0",
+    "datasets>=2.19.0",
+    "matplotlib>=3.8.0",
+]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[tool.setuptools]
+# 只打包源码，明确排除 reference/（原项目快照）、configs/（按路径读取）、
+# data/（数据集）与 outputs/（训练产物）
+packages = ["src", "data"]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.package-data]
+# 演示数据随包分发，便于装完后直接跑通流程
+"data" = ["samples/*.jsonl"]
