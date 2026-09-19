@@ -118,8 +118,9 @@ LLMCL-Rumor/
 | `train_cl.py` | 单轮次对比学习训练（对应 Proposed-1/2/3，M=0） |
 | `joint_align.py` | 完整对齐流程（对应 Proposed-4/5/6，M>0） |
 | `evaluate.py` | 加载 checkpoint 评测并导出指标 / t-SNE 图 |
+| `verify_pipeline.py` | 数据流验证：配置 / 数据 / Prompt / 增强 / 式(7)(8)(9) / 指标（不需要 GPU） |
 | `check_syntax.py` | AST 语法自检（不导入任何依赖） |
-| `check_static.py` | AST 静态一致性自检（`__all__` 覆盖 / 疑似漏 import / 顶层重名） |
+| `check_static.py` | AST 静态一致性自检（`__all__` 覆盖 / 疑似漏 import / 顶层重名 / 跨模块导入） |
 | `check_tracked.py` | 仓库完整性自检（源码是否都被 git 追踪、是否被 gitignore 误伤） |
 
 ### 2.7 `reference/` —— 原开源项目快照
@@ -147,8 +148,8 @@ pip install -r requirements.txt
 pip install -e .          # 可选但推荐：让 src/ 与 data/ 在任意目录都能 import
 
 # 1) 自检（纯 CPU，不需要模型权重和数据）
-pytest tests -q
-python scripts/check_syntax.py && python scripts/check_static.py && python scripts/check_tracked.py
+make check                 # = check_syntax + check_static + check_tracked + verify_pipeline
+pytest tests -q            # 单元测试（无 torch 环境会自动跳过张量用例）
 
 # 2) 数据准备（把 Twitter15/16 放到 data/raw/twitter15/ 后执行）
 python scripts/prepare_data.py --config configs/base.yaml --dataset twitter15
