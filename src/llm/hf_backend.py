@@ -207,13 +207,18 @@ class HFBackend(LLMBackend):
         results: List[GenerationResult] = []
         encoded, _ = self._build_inputs(prompts)
 
+        # 固定随机种子：让同一配置多次运行得到同样的增强结果，便于复现论文数值。
+        # 注意必须用 torch.manual_seed（全局 RNG），因为 transformers 的 generate()
+        # 不接受 generator 参数；逐条设置可以让"第 i 条样本"与批大小无关地可复现。
+        if seed is not None:
+            torch.manual_seed(int(seed))
+
         with torch.no_grad():
             for index, spec in enumerate(prompts):
                 sample_temperature = max(0.01, base_temperature + jitter * ((index % 3) - 1))
-                generator = None
                 if seed is not None:
-                    generator = torch.Generator(device="cpu")
-                    generator.manual_seed(int(seed) + index)
+                    # 每条样本推进一次 RNG，保证样本级可复现（而不是整批一起变）
+                    torch.manual_seed(int(seed) + index)
 
                 single = {
                     key: value[index : index + 1] for key, value in encoded.items()
@@ -254,9 +259,6 @@ class HFBackend(LLMBackend):
                             error=f"生成失败：{exc}",
                         )
                     )
-                finally:
-                    if generator is not None:
-                        del generator
         return results
 
     # ------------------------------------------------------------------ #
