@@ -126,36 +126,62 @@ def compute_loss(
     labels: Any,
     group_ids: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Any]:
-    """把模型输出与损失函数接起来，返回损失字典。"""
+    """把模型输出与损失函数接起来，返回损失字典。
+
+    两种 batch 形态分别处理：
+
+    * **份数一致**（``augmented_projection`` 是 ``[B, K, d]`` 张量）：
+      直接交给 :class:`CombinedLoss`，一次算完全 batch 的交叉熵与 InfoNCE；
+    * **份数不一致**（是长度为 K 的列表，第 k 层只含"至少有 k 份增强样本"的样本）：
+      交叉熵**仍然在全 batch 上算一次**（分类损失与增强份数无关，按层重复计算
+      会让 CE 被重复计入、日志口径也会失真）；InfoNCE 则逐层计算后按层内样本数
+      加权平均——每层能看到的负样本集合不同，只能在层内比较。
+    """
     augmented = outputs.get("augmented_projection")
+
     if isinstance(augmented, list):
-        # 份数不一致：对每个份数层分别计算再取平均（层内样本数可能不同，
-        # 因此按层样本数加权，保证每条样本的贡献权重一致）
-        losses = []
-        weights = []
-        for index, layer in enumerate(augmented):
+        # 全 batch 的分类损失：只算一次，作为最终 CE 项
+        ce_loss = criterion.cross_entropy(outputs["logits"], labels)
+
+        losses: List[Any] = []
+        weights: List[int] = []
+        cl_values: List[float] = []
+        for layer in augmented:
             count = layer.shape[0]
             if count == 0:
                 continue
-            sub_labels = labels[:count]
-            sub_groups = list(group_ids)[:count] if group_ids else None
-            components = criterion(
-                outputs["logits"][:count],
-                sub_labels,
-                anchor_embeddings=outputs["projection"][:count],
-                augmented_embeddings=layer.unsqueeze(1),
-                group_ids=sub_groups,
+            cl_loss = criterion.contrastive(
+                outputs["projection"][:count],
+                layer.unsqueeze(1),
+                labels=labels[:count],
+                group_ids=list(group_ids)[:count] if group_ids else None,
             )
-            losses.append(components["loss"])
+            losses.append(cl_loss)
             weights.append(count)
-        if not losses:
-            return criterion(outputs["logits"], labels)
-        total_weight = float(sum(weights))
-        stacked = sum(loss * (weight / total_weight) for loss, weight in zip(losses, weights))
+            cl_values.append(float(cl_loss.detach().cpu()))
+
+        total = criterion.ce_weight * ce_loss
+        cl_loss_value = 0.0
+        if losses:
+            total_weight = float(sum(weights))
+            weighted_cl = sum(
+                loss * (weight / total_weight) for loss, weight in zip(losses, weights)
+            )
+            total = total + criterion.cl_weight * weighted_cl
+            # 报告口径：按层内样本数加权的 InfoNCE 均值
+            cl_loss_value = sum(
+                value * (weight / total_weight) for value, weight in zip(cl_values, weights)
+            )
+
+        criterion.last_components = {
+            "ce_loss": float(ce_loss.detach().cpu()),
+            "cl_loss": cl_loss_value,
+            "total_loss": float(total.detach().cpu()),
+        }
         return {
-            "loss": stacked,
-            "ce_loss": float(criterion.last_components.get("ce_loss", 0.0)),
-            "cl_loss": float(criterion.last_components.get("cl_loss", 0.0)),
+            "loss": total,
+            "ce_loss": float(ce_loss.detach().cpu()),
+            "cl_loss": cl_loss_value,
         }
 
     return criterion(
