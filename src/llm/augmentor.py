@@ -90,6 +90,7 @@ class Augmentor:
         max_retries: int = 3,
         copies_per_sample: int = 1,
         strict_format: bool = True,
+        require_diversity: bool = True,
         concurrency: int = 1,
         batch_size: int = 4,
         semantic_encoder: Optional[Any] = None,
@@ -105,6 +106,10 @@ class Augmentor:
         self.max_retries = max(1, int(max_retries))
         self.copies_per_sample = max(1, int(copies_per_sample))
         self.strict_format = bool(strict_format)
+        #: 是否把"多样性不足"（模型原样回显输入）也判为失败并重试。
+        #: 回显结果的结构/长度/语义全都合格，只有词级重合度会暴露它没做事，
+        #: 因此默认开启；关闭后回显结果会被当作成功（不推荐，仅供消融）。
+        self.require_diversity = bool(require_diversity)
         self.concurrency = max(1, int(concurrency))
         #: 串行路径下每次交给后端的 Prompt 条数。
         #: 只有 >1 时 transformers 后端才能真正分批前向，温度分档也才有意义。
@@ -238,11 +243,11 @@ class Augmentor:
             )
             cached_text = self._read_cache(cache_key)
             if cached_text is not None:
-                results[position] = (
-                    self._finalize(instance, cached_text, spec, from_cache=True),
-                    True,
-                    True,
+                # 缓存里只会有"曾经通过校验"的结果，因此命中即视为成功
+                final, _report = self._finalize(
+                    instance, cached_text, spec, from_cache=True
                 )
+                results[position] = (final, True, True)
             else:
                 pending.append(position)
                 pending_specs.append(spec)
@@ -274,11 +279,8 @@ class Augmentor:
                         next_active.append(position)
                     continue
 
-                final = self._finalize(instance, result.text, spec, from_cache=False)
-                quality = final.quality or {}
-                if quality.get("structure_ok") and (
-                    not self.strict_format or quality.get("semantic_ok", True)
-                ):
+                final, report = self._finalize(instance, result.text, spec, from_cache=False)
+                if self._is_acceptable(report):
                     # 只有通过校验的结果才写缓存，避免坏结果被永久复用
                     self._write_cache(
                         self._cache_key(spec.prompt_hash, copy_index, self.backend.model_name),
@@ -287,9 +289,7 @@ class Augmentor:
                     )
                     results[position] = (final, False, True)
                 else:
-                    problems[position] = list(quality.get("problems", [])) + list(
-                        quality.get("warnings", [])
-                    )
+                    problems[position] = list(report.problems) + list(report.warnings)
                     attempts[position] += 1
                     if attempts[position] < self.max_retries:
                         next_active.append(position)
@@ -313,6 +313,30 @@ class Augmentor:
 
         return [item for item in results if item is not None]
 
+    def _is_acceptable(self, report: Optional[QualityReport]) -> bool:
+        """判断一份质量报告是否算"增强成功"。
+
+        判定条件：
+
+        * ``structure_ok``：结构必须与原样本一致（硬条件）；
+        * ``strict_format`` 开启时 ``semantic_ok``：长度比例与（可选的）语义相似度
+          都要在合理区间（硬条件）；
+        * ``require_diversity`` 开启时 ``diversity_ok``：词级重合度不能过高。
+
+        为什么把多样性也纳入成功判据：模型"原样回显输入"时，
+        结构、长度比例、语义全都合格——**只有重合度会暴露它没做事**。
+        若不拦住，这种"没做增强"的结果会被当作成功写进缓存并长期复用。
+        代价是"改写幅度不足"的样本会被重试，重试仍不合格则退化为
+        "未增强副本"（``meta.augment_failed=true``），口径上更保守也更诚实。
+        """
+        if report is None or not report.structure_ok:
+            return False
+        if self.strict_format and not report.semantic_ok:
+            return False
+        if self.require_diversity and not report.diversity_ok:
+            return False
+        return True
+
     def _drop_cache(self, key: str) -> None:
         if not self.cache_dir:
             return
@@ -331,12 +355,20 @@ class Augmentor:
         text: str,
         spec: PromptSpec,
         from_cache: bool = False,
-    ) -> DataInstance:
-        """把模型输出转成数据实例（解析 + 质量报告 + 合并）。"""
+    ) -> Tuple[DataInstance, QualityReport]:
+        """把模型输出转成数据实例（解析 + 质量报告 + 合并）。
+
+        Returns:
+            ``(实例, 质量报告)``。**是否算成功由调用方用** :meth:`_is_acceptable`
+            统一判定——这里不设"成功"语义，避免同一个判据出现两份实现。
+        """
         report: Optional[QualityReport] = None
         payload: Optional[Mapping[str, Any]] = None
         try:
-            payload = parse_augmentation_response(text)
+            # 传 expected_uid：模型有时会在答案后面回显输入，
+            # 而回显对象的字段结构与真答案完全一样、也能过结构校验，
+            # 只有 uid 能区分（见 parse_augmentation_response 的说明）。
+            payload = parse_augmentation_response(text, expected_uid=instance.uid)
             report = build_quality_report(
                 instance,
                 payload,
@@ -346,7 +378,7 @@ class Augmentor:
         except ValueError as exc:
             report = QualityReport(structure_ok=False, problems=[f"解析失败：{exc}"])
 
-        success = bool(report is not None and report.structure_ok and report.semantic_ok)
+        success = self._is_acceptable(report)
         augmented = merge_augmentation(
             instance,
             payload,
@@ -359,7 +391,7 @@ class Augmentor:
             success=success,
         )
         augmented.meta["augment_cache_hit"] = bool(from_cache)
-        return augmented
+        return augmented, report
 
     def _failed_copy(
         self, instance: DataInstance, spec: PromptSpec, problems: Sequence[str]

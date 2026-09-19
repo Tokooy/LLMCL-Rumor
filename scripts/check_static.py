@@ -168,26 +168,39 @@ def _module_public_names(path: str) -> Set[str]:
     return names
 
 
-def _collect_signatures(path: str, module_name: str) -> Dict[str, ast.arguments]:
-    """收集一个模块里所有可调用对象的参数表，键形如 ``func`` / ``Class.method``。
+def _collect_signatures(path: str, module_name: str) -> Dict[str, Tuple[ast.arguments, bool]]:
+    """收集一个模块里所有可调用对象的 ``(参数表, 是否静态方法)``。
 
-    只做浅层解析（模块级函数 + 类内方法），这已经覆盖了本项目里绝大多数
+    键形如 ``func`` / ``Class.method``。**必须记录是否 @staticmethod**：
+    静态方法没有隐式绑定的首参，若一律按方法对待会把它唯一的参数当成 ``self``
+    丢掉，于是 ``Config._unwrap(x)`` 会被误报成"最多接受 0 个位置参数"。
+
+    只做浅层解析（模块级函数 + 类内方法），这已覆盖本项目里绝大多数
     "跨文件调用"的场景。
     """
-    signatures: Dict[str, ast.arguments] = {}
+    signatures: Dict[str, Tuple[ast.arguments, bool]] = {}
     try:
         with open(path, "r", encoding="utf-8") as handle:
             tree = ast.parse(handle.read(), path)
     except (OSError, SyntaxError):
         return signatures
 
+    def is_static(node: ast.AST) -> bool:
+        for decorator in getattr(node, "decorator_list", []):
+            name = decorator.id if isinstance(decorator, ast.Name) else (
+                decorator.attr if isinstance(decorator, ast.Attribute) else ""
+            )
+            if name == "staticmethod":
+                return True
+        return False
+
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            signatures[node.name] = node.args
+            signatures[node.name] = (node.args, False)
         elif isinstance(node, ast.ClassDef):
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    signatures[f"{node.name}.{item.name}"] = item.args
+                    signatures[f"{node.name}.{item.name}"] = (item.args, is_static(item))
     return signatures
 
 
@@ -304,8 +317,8 @@ class SignatureIndex:
                         mapping[alias.asname or alias.name] = f"{node.module}.{alias.name}"
             self.imports[module_name] = mapping
 
-    def resolve(self, current_module: str, dotted: str) -> Optional[ast.arguments]:
-        """把一次调用的名字解析成目标函数的参数表；无法确定时返回 None。"""
+    def resolve(self, current_module: str, dotted: str) -> Optional[Tuple[ast.arguments, bool]]:
+        """把一次调用的名字解析成 ``(参数表, 是否静态方法)``；无法确定时返回 None。"""
         parts = dotted.split(".")
         # 情况一：本模块内的函数/方法
         for cut in range(len(parts), 0, -1):
@@ -353,12 +366,13 @@ def check_call_signatures(
         def visit_Call(self, node: ast.Call) -> None:
             name = self._dotted_name(node.func)
             if name:
-                signature = index.resolve(current_module, name)
-                if signature is not None:
-                    # 形如 A.b(...) 的目标是类方法/实例方法，跳过隐式首参
-                    is_method = "." in name
+                resolved = index.resolve(current_module, name)
+                if resolved is not None:
+                    arguments, is_static = resolved
+                    # 形如 A.b(...) 且不是 @staticmethod 的目标才有隐式首参
+                    is_method = "." in name and not is_static
                     for problem in _signature_problems(
-                        signature, node, name, is_method=is_method
+                        arguments, node, name, is_method=is_method
                     ):
                         problems.append(f"{path}:{node.lineno}: {problem}")
             self.generic_visit(node)

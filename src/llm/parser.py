@@ -71,24 +71,32 @@ _THINK_BLOCK_PATTERNS = (
 
 #: 只有闭合标签的形态（推理 API 常见：开标签被服务端吃掉，正文里只剩闭合标签）。
 #: 竖向分隔符有半角 ``|`` 与全角 ``｜`` 两种写法。
-#: 不参与 ``.format(tag=...)``，因为里面的大括号会被当成格式占位符。
+#:
+#: **只识别已知的收尾关键字**（end / thinking / analysis / reasoning）——
+#: 早期实现把所有 ``<|…|>`` 形状的片段都当标签剥掉，结果会把正文里合法的
+#: 尖括号内容（例如 "see the marker <|note|> in text"）一起吃掉。
+#: 这个模式**不参与** ``.format(tag=...)``，也不编进 ``_THINK_REGEXES``：
+#: 它由 :func:`strip_wrappers` 单独处理（保留标签之后的内容）。
 _CLOSE_ONLY_PATTERN = (
-    r"<[/\u005c]?[|\uff5c][^<>\n]{0,40}[|\uff5c]\s*>"
+    r"<[/\u005c]?[|\uff5c][^<>\n]{0,40}?"
+    r"(?:end|thinking|analysis|reasoning)[^<>\n]{0,20}?[|\uff5c]\s*>"
 )
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*|\s*```\s*$")
 _CLOSE_ONLY_RE = re.compile(_CLOSE_ONLY_PATTERN, re.IGNORECASE)
 
 
 def _think_block_regex(tag: str) -> re.Pattern:
-    """把某个思考块标签的所有已知写法编译成一个正则。
+    """把某个思考块标签的**成对**写法编译成一个正则。
 
-    不同写法的闭合标签差异很大（``</think>`` 与 ``<｜end▁of▁thinking｜>``），
+    不同写法的闭合标签差异很大（``</think>`` 与 ``<|end|>``），
     因此把候选模式用 ``|`` 连起来，一次性替换掉所有形态。
+
+    注意：只有闭合标签的形态（:data:`_CLOSE_ONLY_PATTERN`）**不在这里**，
+    它需要"保留标签之后的内容"这一处理，由 :func:`strip_wrappers` 单独负责。
     """
     alternatives = [
         pattern.format(tag=re.escape(tag)) for pattern in _THINK_BLOCK_PATTERNS
     ]
-    alternatives.append(_CLOSE_ONLY_PATTERN)
     return re.compile("(?:" + "|".join(alternatives) + ")", re.DOTALL | re.IGNORECASE)
 
 
@@ -113,14 +121,16 @@ def strip_wrappers(text: str) -> str:
     处理顺序（每一步都只在"结果仍然含有 JSON"时才采纳，避免把答案一起丢掉）：
 
     1. 剥 ``` 围栏；
-    2. 剥**成对**的思考块（含三种已知写法）；
-    3. 处理**只有闭合标签**的形态：闭合标签之前是思考过程、之后才是答案，
-       若"闭合标签之后"能解析出 JSON，就整段替换为之后的部分。
-       这一步是必要的——真实推理 API 常把开标签吃掉，只剩
-       ``<｜end▁of▁thinking｜>``；此时思考过程里的示例 JSON 会排在答案前面，
-       只删标签的话括号扫描会抽到思考过程里的那个诱饵对象；
+    2. 若出现**只有闭合标签**的形态（推理 API 常把开标签吃掉，只剩
+       ``<｜end▁of▁thinking｜>``）：该标签**之前**是思考过程、**之后**才是答案，
+       因此整段替换为之后的部分。这一步必须在第 3 步之前做，
+       否则思考过程里的示例 JSON 会排在答案前面；
+    3. 剥**成对**的思考块（三种已知写法）；
     4. 兜底：出现未知写法的 ``<think>`` 开标签时，若"标签之前"能解析出 JSON
        就只保留之前的部分。
+
+    注意：只有闭合标签的模式**只匹配已知收尾关键字**（end / thinking /
+    analysis / reasoning），因此不会误伤正文里合法的 ``<|...|>`` 内容。
     """
     if not text:
         return ""
@@ -132,11 +142,7 @@ def strip_wrappers(text: str) -> str:
         result = _FENCE_RE.sub("", result, count=1)
         result = result.strip()
 
-    # 2) 剥成对思考块
-    for regex in _THINK_REGEXES:
-        result = regex.sub("", result).strip()
-
-    # 3) 只有闭合标签：保留标签之后的内容
+    # 2) 只有闭合标签：保留标签之后的内容
     close_match = None
     for match in _CLOSE_ONLY_RE.finditer(result):
         close_match = match  # 取最后一个
@@ -144,6 +150,14 @@ def strip_wrappers(text: str) -> str:
         after = result[close_match.end():].strip()
         if after and _has_json(after):
             result = after
+        else:
+            # 标签之后没有 JSON，说明标签只是正文里的一个标记，删掉即可
+            before = result[: close_match.start()].strip()
+            result = (before + " " + after).strip() if before and after else (before or after)
+
+    # 3) 剥成对思考块
+    for regex in _THINK_REGEXES:
+        result = regex.sub("", result).strip()
 
     # 4) 兜底：未知写法的开标签 → 若标签之前有 JSON，只保留之前的部分
     for tag in _THINK_TAGS:
@@ -248,20 +262,30 @@ def extract_json_object(text: str, prefer_last: bool = False) -> Dict[str, Any]:
     return candidates[-1] if prefer_last else candidates[0]
 
 
-def parse_augmentation_response(text: str) -> Dict[str, Any]:
+def parse_augmentation_response(
+    text: str,
+    expected_uid: Optional[str] = None,
+) -> Dict[str, Any]:
     """解析并做基础字段检查，返回 ``{uid, string_value, replies}``。
 
-    **JSON 抽取策略：优先取最后一个顶层 JSON 对象。**
+    **JSON 抽取策略（两步）**：
 
-    理由：推理型模型的输出结构是"思考过程 → 答案"，而思考过程里经常出现
-    **格式完全合法的示例 JSON**（例如"Example of the required shape: {...}"）。
-    这类诱饵与真答案在字段上无法区分——两者都有 ``uid`` / ``string_value`` /
-    ``replies`` 且都能通过结构校验。唯一的稳定判据是**位置**：
+    1. **按 uid 匹配**（``expected_uid`` 非空时）：只接受 ``uid`` 与预期一致、
+       且能通过结构校验的候选对象，取**最后一个**满足条件的；
+    2. **按位置回退**：没有传 ``expected_uid``、或没有候选 uid 匹配时，
+       取**最后一个**能通过校验的候选。
 
-    * 约定"答案写在最后" → 取最后一个候选；
-    * 若最后一个候选校验失败（缺字段等），则依次回退到其它候选
-      （按"从后往前"的顺序），因此单对象、纯 JSON、前后夹说明文字等
-      常见形态都不受影响。
+    为什么需要第 1 步：推理型模型的输出是"思考过程 → 答案"，思考过程里经常出现
+    **格式完全合法的示例 JSON**；而模型有时还会在答案**后面**再回显一次输入
+    （"For reference, the input was: {...}"）。这两种诱饵与真答案在字段上无法
+    区分（都有 ``uid``/``string_value``/``replies``，都能过结构校验），
+    位置规则（"取最后一个"）只能覆盖前者。**uid 是唯一可靠的判据**：
+    :class:`~src.llm.augmentor.Augmentor` 知道它请求的是哪条样本，
+    因此把 uid 传进来即可同时挡掉"前面的示例"和"后面的回显"。
+
+    Args:
+        text: 模型原始输出。
+        expected_uid: 期望的样本 uid；``None`` 表示不做 uid 过滤。
 
     Raises:
         ValueError: JSON 非法、字段缺失或字段类型不对。
@@ -282,7 +306,18 @@ def parse_augmentation_response(text: str) -> Dict[str, Any]:
     if not candidates:
         raise ValueError("模型输出中找不到合法的 JSON 对象")
 
-    # 从后往前尝试：最后一个是答案，前面的是思考过程里的示例
+    # ---- 第 1 步：优先取"uid 匹配 + 校验通过"的最后一个候选 ----
+    if expected_uid is not None:
+        target = str(expected_uid)
+        for payload in reversed(candidates):
+            if str(payload.get("uid", "")) != target:
+                continue
+            try:
+                return _validate_augmentation_payload(payload)
+            except ValueError:
+                continue
+
+    # ---- 第 2 步：不看 uid，从后往前取第一个校验通过的 ----
     last_error: Optional[Exception] = None
     for payload in reversed(candidates):
         try:

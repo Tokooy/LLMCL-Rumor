@@ -212,6 +212,9 @@ def build_augmentor(
         strict_format=bool(overrides.get(
             "strict_format", config.get_path("llm.augmentation.strict_format", True)
         )),
+        require_diversity=bool(overrides.get(
+            "require_diversity", config.get_path("llm.augmentation.require_diversity", True)
+        )),
         concurrency=effective_concurrency,
         batch_size=int(config.get_path("llm.augmentation.batch_size", 4)),
         overlap_max=float(overrides.get(

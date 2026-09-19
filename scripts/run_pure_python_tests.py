@@ -36,6 +36,7 @@ import inspect
 import logging
 import os
 import pathlib
+import re
 import shutil
 import sys
 import traceback
@@ -87,10 +88,16 @@ class _Approx:
 
 
 class _Raises:
-    """``pytest.raises`` 的最小实现。"""
+    """``pytest.raises`` 的最小实现（含 ``match=`` 正则校验）。
 
-    def __init__(self, expected: Any):
+    ``match`` 必须实现：本项目有 20 处 ``pytest.raises(..., match="...")``，
+    只校验异常类型的话，"异常消息写错了"这类问题在本地跑不出来，
+    但换到真 pytest 下就会失败——那会让这份实跑结果的可信度虚高。
+    """
+
+    def __init__(self, expected: Any, match: Optional[str] = None):
         self.expected = expected
+        self.match = match
         self.value: Optional[BaseException] = None
 
     def __enter__(self) -> "_Raises":
@@ -99,8 +106,14 @@ class _Raises:
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc_type is None:
             raise AssertionError(f"DID NOT RAISE {self.expected}")
+        if not issubclass(exc_type, self.expected):
+            return False
+        if self.match is not None and not re.search(self.match, str(exc)):
+            raise AssertionError(
+                f"异常消息不匹配 match={self.match!r}；实际消息：{str(exc)!r}"
+            )
         self.value = exc
-        return issubclass(exc_type, self.expected)
+        return True
 
 
 def install_pytest_stub() -> bool:
@@ -162,7 +175,7 @@ def install_pytest_stub() -> bool:
     stub.importorskip = importorskip
     stub.skip = skip
     stub.approx = lambda expected, rel=None, abs=None: _Approx(expected, rel, abs)
-    stub.raises = lambda expected, **kwargs: _Raises(expected)
+    stub.raises = lambda expected, match=None, **kwargs: _Raises(expected, match=match)
     stub.fixture = fixture
     stub.mark = _Mark()
     stub.main = lambda *a, **k: 0

@@ -503,7 +503,8 @@ class TestDemoBackend:
             cache_dir=str(tmp_path / "cache"),
             max_retries=2,
             copies_per_sample=1,
-            strict_format=False,   # 伪增强不满足多样性约束，测试里放宽
+            strict_format=False,     # 伪增强不满足多样性约束，测试里放宽
+            require_diversity=False,  # demo 后端是机械替换，重合度必然高
             concurrency=1,
         )
         augmented, stats = augmentor.augment(demo_instances, augment_round=1)
@@ -524,10 +525,59 @@ class TestDemoBackend:
             prompt_builder=prompt_builder,
             cache_dir=cache_dir,
             strict_format=False,
+            require_diversity=False,
         )
         augmentor.augment(demo_instances, augment_round=1)
         _second, stats = augmentor.augment(demo_instances, augment_round=1)
         assert stats.cached == len(demo_instances)
+
+    def test_diversity_gate_rejects_self_echo(self, demo_instances, prompt_builder):
+        """回显输入的"增强"必须被拒——这是多样性门槛存在的理由。
+
+        构造一个把输入原样吐回的后端：结构、长度比例、语义全部合格，
+        只有词级重合度能暴露它没做事。开启 require_diversity 时应失败，
+        关闭时才会被当成成功。
+        """
+        import json
+
+        from src.llm.augmentor import Augmentor
+        from src.llm.base import GenerationResult
+
+        class EchoBackend:
+            name = "echo"
+            model_name = "echo"
+            supports_finetuning = False
+            supports_task_vector = False
+
+            def generate(self, prompts, temperature=None, **kwargs):
+                results = []
+                for spec in prompts:
+                    instance = json.loads(
+                        spec.user.split("<instance>")[1].split("</instance>")[0]
+                    )
+                    results.append(
+                        GenerationResult(
+                            text=json.dumps(instance, ensure_ascii=False),
+                            uid=str(spec.meta.get("uid", "")),
+                            prompt_hash=spec.prompt_hash,
+                        )
+                    )
+                return results
+
+        strict = Augmentor(
+            backend=EchoBackend(), prompt_builder=prompt_builder, cache_dir=None,
+            max_retries=1, strict_format=True, require_diversity=True,
+        )
+        _augmented, stats = strict.augment(demo_instances[:3], augment_round=1)
+        assert stats.failed == 3, "原样回显必须被多样性门槛拦下"
+        assert stats.succeeded == 0
+
+        lenient = Augmentor(
+            backend=EchoBackend(), prompt_builder=prompt_builder, cache_dir=None,
+            max_retries=1, strict_format=True, require_diversity=False,
+        )
+        _augmented2, stats2 = lenient.augment(demo_instances[:3], augment_round=1)
+        assert stats2.succeeded == 3, "关闭门槛后回显结果会被接受（仅用于消融）"
 
     def test_no_cache_means_no_reuse(self, demo_instances, prompt_builder):
         from src.llm.augmentor import Augmentor

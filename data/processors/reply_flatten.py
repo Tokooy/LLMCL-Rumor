@@ -165,8 +165,6 @@ def _allocate_budget(
         # 原帖本身超预算：把**全部预算**给它（而不是只给 source_cap），
         # 否则会白白浪费掉 total_words - source_cap 个词的额度。
         return min(source_words, total_words), [0] * len(reply_word_counts)
-        # 原帖本身超预算：全部给它，回复不再纳入
-        return source_cap, [0] * len(reply_word_counts)
 
     remaining = total_words - source_budget
     reply_budgets: List[int] = []
