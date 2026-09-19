@@ -10,7 +10,7 @@ CONFIG ?= configs/base.yaml
 EXPERIMENT ?= configs/experiments/proposed-3.yaml
 DATASET ?= twitter15
 
-.PHONY: help check syntax static tracked test prepare augment train-cl joint-align evaluate clean
+.PHONY: help check syntax static tracked verify test prepare augment train-cl joint-align evaluate clean
 
 help:  ## 显示所有可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -21,13 +21,16 @@ help:  ## 显示所有可用命令
 syntax:  ## AST 语法自检（每个 .py 文件）
 	$(PYTHON) scripts/check_syntax.py --verbose
 
-static:  ## AST 静态一致性自检（__all__ / 漏 import / 重名）
+static:  ## AST 静态一致性自检（__all__ / 漏 import / 重名 / 跨模块导入）
 	$(PYTHON) scripts/check_static.py
 
 tracked:  ## 仓库完整性自检（源码是否都被 git 追踪 / 是否被 gitignore 误伤）
 	$(PYTHON) scripts/check_tracked.py
 
-check: syntax static tracked  ## 执行全部三项静态自检
+verify:  ## 数据流验证（配置/数据/Prompt/增强/式(7)(8)(9)/指标，不需要 GPU）
+	$(PYTHON) scripts/verify_pipeline.py
+
+check: syntax static tracked verify  ## 执行全部四项静态自检
 
 test:  ## 运行单元测试（无 GPU 环境会自动跳过 torch 用例）
 	$(PYTHON) -m pytest tests -q

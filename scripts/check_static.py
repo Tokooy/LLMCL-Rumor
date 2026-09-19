@@ -10,7 +10,10 @@
    子模块名会被正确识别，不会误报）；
 2. 函数体内引用的裸名既不是局部变量（含闭包捕获）、不是模块级名字、
    也不是内置名或 ``self``/``cls``（典型的"忘了 import"或"变量名写错"）；
-3. 同一模块内重复定义的顶层函数/类名。
+3. 同一模块内重复定义的顶层函数/类名；
+4. **跨模块导入交叉检查**：``from src.x.y import name`` 里的模块文件是否存在、
+   ``name`` 是否真的在目标模块里定义（这类错误会让测试在收集阶段就 ImportError，
+   而本机没装 torch 时根本跑不到那一步）。
 
 用法::
 
@@ -33,12 +36,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_TARGETS = ["src", "scripts", "tests", "data"]
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "build", "dist", "node_modules"}
 IMPLICIT_LOCALS = {"self", "cls", "__class__"}
-SCOPE_BINDING_NODES = (
-    ast.FunctionDef,
-    ast.AsyncFunctionDef,
-    ast.ClassDef,
-    ast.Lambda,
-)
+#: 参与跨模块导入检查的包前缀
+CHECKED_PACKAGES = ("src", "data")
 
 
 def iter_python_files(targets: List[str]) -> List[str]:
@@ -137,6 +136,69 @@ def _submodules(package_init: str, tree: ast.Module) -> Set[str]:
     return modules
 
 
+def _module_public_names(path: str) -> Set[str]:
+    """收集一个模块里被定义/导入的名字集合（用于跨模块导入检查）。"""
+    with open(path, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), path)
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+
+def check_cross_module_imports(path: str, source: str) -> List[str]:
+    """检查 ``from src./data. import ...`` 的模块与名字是否真实存在。
+
+    这类错误在没装 torch 的机器上跑 pytest 是查不出来的：测试收集阶段就会
+    ImportError，但因为 ``importorskip`` 之前就崩了，报错信息也不明显。
+    纯 AST 检查可以提前把这类问题抓出来。
+    """
+    problems: List[str] = []
+    try:
+        tree = ast.parse(source, path)
+    except SyntaxError:
+        return problems  # 语法错误由 check_syntax.py 负责报
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        if not node.module.startswith(tuple(f"{name}." for name in CHECKED_PACKAGES)):
+            continue
+
+        module_path = os.path.join(REPO_ROOT, node.module.replace(".", os.sep) + ".py")
+        if not os.path.isfile(module_path):
+            # 也可能是包（目录 + __init__.py）
+            package_path = os.path.join(
+                REPO_ROOT, node.module.replace(".", os.sep), "__init__.py"
+            )
+            if not os.path.isfile(package_path):
+                problems.append(
+                    f"{path}:{node.lineno}: 模块 {node.module!r} 不存在"
+                    f"（既不是 {os.path.relpath(module_path, REPO_ROOT)} 也不是包）"
+                )
+                continue
+            module_path = package_path
+
+        if not os.path.isfile(module_path):
+            continue
+
+        available = _module_public_names(module_path)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            if alias.name not in available:
+                problems.append(
+                    f"{path}:{node.lineno}: {node.module} 中不存在 {alias.name!r}"
+                )
+    return problems
+
+
 def check_module(path: str) -> List[str]:
     """返回该模块的所有静态提示。"""
     problems: List[str] = []
@@ -226,6 +288,9 @@ def check_module(path: str) -> List[str]:
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     visitor._check(item)
+
+    # ---- 4) 跨模块导入交叉检查 ----
+    problems.extend(check_cross_module_imports(path, source))
 
     return problems
 

@@ -177,20 +177,37 @@ def to_dict(config: Any) -> Any:
 # 加载逻辑
 # ---------------------------------------------------------------------- #
 def _read_yaml(path: str) -> Dict[str, Any]:
-    """读取单个 YAML 文件；文件不存在或为空时返回空 dict。"""
+    """读取单个 YAML 文件；文件不存在或为空时返回空 dict。
+
+    优先使用 pyyaml；未安装时回退到 :mod:`src.utils.minimal_yaml` 的极简解析器
+    （本项目配置用到的语法很窄，回退实现足以覆盖）。回退时会在 stderr 打印一行
+    提示，避免"用了另一个解析器"这件事被悄悄忽略。
+    """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"配置文件不存在：{path}")
+
     try:
         import yaml  # 延迟导入：仅此函数需要 pyyaml
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "加载 YAML 配置需要 pyyaml，请先执行 pip install pyyaml"
-        ) from exc
+    except ImportError:
+        yaml = None
 
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
-    if raw is None:
-        return {}
+    if yaml is not None:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+        if raw is None:
+            return {}
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"{path} 的顶层结构必须是映射（mapping）")
+        return Config._unwrap(raw)  # type: ignore[return-value]
+
+    from .minimal_yaml import simple_yaml_load
+    from .logger import get_logger
+
+    get_logger("config").warning(
+        f"未安装 pyyaml，改用内置极简解析器读取 {path}；"
+        "如需与官方 YAML 语义完全一致，请执行 pip install pyyaml"
+    )
+    raw = simple_yaml_load(path)
     if not isinstance(raw, Mapping):
         raise TypeError(f"{path} 的顶层结构必须是映射（mapping）")
     return Config._unwrap(raw)  # type: ignore[return-value]
@@ -206,7 +223,8 @@ def _resolve_defaults(
     约定：``defaults`` 中的路径相对当前文件所在目录解析；
     最终合并顺序为「先 defaults（按书写顺序），后文件自身」，即文件自身优先级最高。
 
-    同时维护一个 ``_stack`` 用于检测循环继承，避免无限递归。
+    ``_seen`` 用于检测循环继承；``_stack`` 用于记录"这份配置由哪几个文件合成"，
+    结果会被写进 ``_config_sources``（排查"这个值到底来自哪份配置"时很有用）。
     """
     seen = list(_seen or [])
     real = os.path.abspath(path)
@@ -214,6 +232,8 @@ def _resolve_defaults(
         chain = " -> ".join(seen + [real])
         raise ValueError(f"检测到配置的循环 defaults 继承：{chain}")
     seen.append(real)
+    if _stack is not None:
+        _stack.append(real)
 
     raw = _read_yaml(real)
     defaults = raw.pop("defaults", None)
@@ -230,7 +250,6 @@ def _resolve_defaults(
             deep_update(base, _resolve_defaults(entry_path, seen, _stack))
 
     deep_update(base, raw)
-    base["_config_sources"] = list(_stack or []) + [real] if _stack is not None else [real]
     return base
 
 
