@@ -171,6 +171,35 @@ class TestMinimalYaml:
         assert _parse_scalar("[a, b, c]") == ["a", "b", "c"]
         assert _parse_scalar("[]") == []
 
+    def test_flow_mapping(self):
+        """流式映射：``{}`` / ``{a: 1}``。
+
+        回归测试：早期实现把 ``{}`` 当成普通字符串返回，于是
+        ``configs/base.yaml`` 里的 ``extra_body: {}`` 拿到的是 ``"{}"``，
+        下游 ``dict(...)`` 直接抛 ValueError——而且**只在没装 pyyaml 的机器上**出现
+        （pyyaml 会正确解析成空字典），属于最难发现的一类回退实现缺陷。
+        """
+        from src.utils.minimal_yaml import _parse_scalar
+
+        assert _parse_scalar("{}") == {}
+        assert _parse_scalar("{a: 1, b: two}") == {"a": 1, "b": "two"}
+        assert _parse_scalar('{"quoted": 1}') == {"quoted": 1}
+
+    def test_empty_flow_mapping_in_real_config(self):
+        """真实配置里的 extra_body 必须是 dict，且能安全交给底层后端。"""
+        from src.utils.config import load_config
+        from src.utils.minimal_yaml import simple_yaml_load
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(repo_root, "configs", "base.yaml")
+        # 回退解析器
+        assert isinstance(simple_yaml_load(path)["llm"]["api"]["extra_body"], dict)
+        # Config 包装后（无论走 pyyaml 还是回退解析器）
+        config = load_config(path)
+        value = config.get_path("llm.api.extra_body")
+        assert isinstance(value, dict), f"extra_body 应为 dict，实际 {type(value).__name__}"
+        assert dict(value) == {}
+
     def test_nested_mapping_and_list(self, tmp_path):
         from src.utils.minimal_yaml import simple_yaml_load
 

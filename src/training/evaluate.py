@@ -308,7 +308,20 @@ def save_predictions(
     """保存 ``uid / pred / true`` 三元组（论文附录常用的预测明细）。
 
     Args:
+        path: 输出 JSONL 路径。
+        uids: 样本 uid 序列。
+        predictions: 预测标签（下标）。
+        references: 真实标签（下标）。
         probabilities: 可选的 ``[N, C]`` 概率矩阵，写入每类的置信度。
+
+    Returns:
+        **输出文件的路径**（不是行数）。
+
+    Note:
+        :func:`src.utils.io_utils.write_jsonl` 返回的是写入行数，因此这里必须
+        显式返回 ``path``——曾经直接 ``return write_jsonl(...)``，让返回值变成了
+        一个 int，调用方按"返回路径"使用时会得到诸如 ``open(2)`` 的
+        诡异错误（Windows 下表现为 OSError/崩溃）。
     """
     records: List[Dict[str, Any]] = []
     for index, uid in enumerate(uids):
@@ -329,7 +342,9 @@ def save_predictions(
             except (TypeError, IndexError):  # pragma: no cover
                 pass
         records.append(record)
-    return write_jsonl(path, records)
+
+    write_jsonl(path, records)
+    return path
 
 
 def _as_int(value: Any) -> Optional[int]:

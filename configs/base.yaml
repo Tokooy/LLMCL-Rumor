@@ -146,9 +146,11 @@ llm:
     max_retries: 3
     # 缓存目录：同一样本 + 同一 prompt + 同一模型只调用一次 LLM
     cache_dir: outputs/cache/augmentation
-    # 并发请求数（api 后端）/ 本地批大小（transformers 后端）
+    # 并发请求数（api 后端）/ 每个 generate 批次的样本数（transformers 后端）
     batch_size: 4
-    # 每条样本的增强温度抖动范围，避免整批增强"同质化"
+    # 每条样本的增强温度抖动范围。
+    # transformers 后端会据此把样本分成 base-jitter / base / base+jitter 三档并**分批**生成，
+    # 这是论文"多样性提升"目标在生成侧的落点；设为 0 则整批同温（多样性只来自采样）。
     temperature_jitter: 0.05
 
   lora:

@@ -426,7 +426,16 @@ class CLTrainer:
             labels = batch["label"]
             group_ids = list(batch.get("uid") or range(labels.shape[0]))
             outputs = _forward_batch(self.model, batch, paired=True)
-            components = compute_loss(self.criterion, outputs, labels, group_ids=group_ids)
+            # 必须把 collate_pairs 给出的"每层成员下标"传下去：
+            # ragged batch 里层成员**不是前缀**，缺了它 compute_loss 只能按
+            # [:count] 切片，会把 A 的锚点与 B 的增强样本配成正样本且不报错。
+            components = compute_loss(
+                self.criterion,
+                outputs,
+                labels,
+                group_ids=group_ids,
+                augmented_indices=batch.get("augmented_indices"),
+            )
             loss = components["loss"] / self.gradient_accumulation_steps
             loss.backward()
 

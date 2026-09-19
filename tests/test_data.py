@@ -168,11 +168,19 @@ class TestReplyFlatten:
         replies = [Reply("r1", "   ", []), Reply("r2", "real", [])]
         assert [segment.uid for segment in flatten_replies(replies)] == ["r2"]
 
-    def test_invalid_order_raises(self, demo_instances):
+    def test_invalid_order_raises(self, demo_path):
+        """order 参数非法时必须抛错——**用带回复的实例**才能走到校验分支。"""
+        from data.processors.data_model import Reply, iter_replies
         from data.processors.reply_flatten import flatten_replies
 
+        replies = [Reply("r1", "one", [Reply("r1-1", "deep", [])])]
         with pytest.raises(ValueError):
-            flatten_replies(demo_instances[0].replies, order="random")
+            flatten_replies(replies, order="random")
+        with pytest.raises(ValueError):
+            list(iter_replies(replies, order="random"))
+        # bfs / dfs 都必须正常
+        assert len(flatten_replies(replies, order="bfs")) == 2
+        assert len(flatten_replies(replies, order="dfs")) == 2
 
 
 class TestEncoderText:
@@ -596,13 +604,29 @@ class TestPairDataset:
 # ===================================================================== #
 class TestDemoData:
     def test_demo_file_matches_generator_records(self, demo_path):
-        """已提交的 demo_twitter15.jsonl 必须与 make_demo.DEMO_RECORDS 一致。"""
+        """已提交的 demo_twitter15.jsonl 必须与 make_demo.DEMO_RECORDS 一致。
+
+        只读该文件（不写回），因此在只读沙箱下也能跑。
+        """
         from data.samples.make_demo import DEMO_RECORDS, build_instance
 
         with open(demo_path, "r", encoding="utf-8") as handle:
             actual = [json.loads(line) for line in handle if line.strip()]
         expected = [build_instance(record).to_record() for record in DEMO_RECORDS]
-        assert actual == expected
+        assert len(actual) == len(expected), f"条数不一致：{len(actual)} vs {len(expected)}"
+        for index, (got, want) in enumerate(zip(actual, expected)):
+            assert got == want, f"第 {index + 1} 条（uid={want['uid']}）与生成器不一致"
+
+    def test_demo_file_is_read_only_in_tests(self, demo_file):
+        """需要写文件的场景必须用 demo_file（临时副本），避免污染工作区。"""
+        from src.utils.io_utils import read_jsonl
+
+        records = read_jsonl(demo_file)
+        assert len(records) == 10
+        assert demo_file != os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "samples", "demo_twitter15.jsonl",
+        )
 
     def test_demo_covers_all_four_labels(self, demo_instances):
         from data.processors.data_model import LABELS

@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from tests.conftest import require_torch
@@ -19,52 +21,121 @@ from tests.conftest import require_torch
 # ===================================================================== #
 # 式(8)：λ 的动量更新
 # ===================================================================== #
+class _Number:
+    """最小数值替身：支持标量算术与 ``shape`` / ``numel``。
+
+    用于在**没有 torch** 的环境下验证 :mod:`src.llm.task_vector` 的算子语义
+    （τ = θ_ft − θ_0 是逐元素减法，与后端无关）。
+    注意：不能让测试直接用 Python ``list``——``list - list`` 是 TypeError，
+    那样测试会因为"用法错误"而失败，而不是因为被测逻辑有问题。
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: float):
+        self.value = float(value)
+
+    def __sub__(self, other: "_Number") -> "_Number":
+        return _Number(self.value - other.value)
+
+    def __add__(self, other: "_Number") -> "_Number":
+        return _Number(self.value + other.value)
+
+    def __mul__(self, other: float) -> "_Number":
+        return _Number(self.value * other)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, _Number):
+            return self.value == other.value
+        return self.value == other
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"_Number({self.value})"
+
+    def numel(self) -> int:
+        return 1
+
+    @property
+    def shape(self) -> tuple:
+        return (1,)
+
+    def item(self) -> float:
+        return self.value
+
+
+# ===================================================================== #
+# 任务向量容器
+# ===================================================================== #
 class TestTaskVectorContainer:
     """任务向量容器的约束检查。"""
 
-    def test_subtract_parameters_with_lists(self):
-        """纯列表（可用 Python 数值）也能算 τ = θ_ft - θ_0。"""
+    def test_subtract_parameters_with_scalars(self):
+        """τ = θ_ft − θ_0 是逐元素减法（用最小数值替身验证，不依赖 torch）。"""
         from src.llm.task_vector import subtract_parameters
 
-        base = {"a": [1.0, 2.0], "b": [0.0]}
-        finetuned = {"a": [2.0, 1.0], "b": [3.0]}
+        base = {"a": _Number(1.0), "b": _Number(0.0)}
+        finetuned = {"a": _Number(2.0), "b": _Number(3.0)}
         vector = subtract_parameters(finetuned, base)
-        assert vector["a"] == [1.0, -1.0]
-        assert vector["b"] == [3.0]
+        assert vector["a"] == _Number(1.0)
+        assert vector["b"] == _Number(3.0)
 
     def test_subtract_parameters_missing_key_raises(self):
         from src.llm.task_vector import subtract_parameters
 
         with pytest.raises(KeyError):
-            subtract_parameters({"a": [1.0], "b": [1.0]}, {"a": [0.0]})
+            subtract_parameters(
+                {"a": _Number(1.0), "b": _Number(1.0)}, {"a": _Number(0.0)}
+            )
+
+    def test_add_and_scale_operators(self):
+        from src.llm.task_vector import add_task_vectors, scale_task_vector
+
+        left = {"w": _Number(1.0)}
+        right = {"w": _Number(2.0)}
+        assert add_task_vectors(left, right, scale=0.5)["w"] == _Number(2.0)
+        assert scale_task_vector(left, 3.0)["w"] == _Number(3.0)
 
     def test_container_rejects_mismatched_keys(self):
         from src.llm.task_vector import TaskVector
 
         with pytest.raises(ValueError, match="参数集合"):
-            TaskVector([{"a": [1.0]}, {"b": [1.0]}])
+            TaskVector([{"a": _Number(1.0)}, {"b": _Number(1.0)}])
+
+    def test_container_rejects_mismatched_shapes(self):
+        class Wide(_Number):
+            @property
+            def shape(self) -> tuple:
+                return (2,)
+
+        from src.llm.task_vector import TaskVector
+
+        with pytest.raises(ValueError, match="形状"):
+            TaskVector([{"a": _Number(1.0)}, {"a": Wide(1.0)}])
 
     def test_container_records_weights_and_rounds(self):
         from src.llm.task_vector import TaskVector
 
-        container = TaskVector([{"a": [1.0]}], weights=[0.3], rounds=[2])
-        container.append({"a": [2.0]}, weight=0.7)
+        container = TaskVector([{"a": _Number(1.0)}], weights=[0.3], rounds=[2])
+        container.append({"a": _Number(2.0)}, weight=0.7)
         assert container.num_vectors == 2
         assert container.weights == [0.3, 0.7]
         assert container.rounds == [2, 3]
-        assert container.latest() == {"a": [2.0]}
+        assert container.latest()["a"] == _Number(2.0)
 
     def test_container_rejects_mismatched_weights(self):
         from src.llm.task_vector import TaskVector
 
         with pytest.raises(ValueError, match="weights"):
-            TaskVector([{"a": [1.0]}], weights=[0.1, 0.2])
+            TaskVector([{"a": _Number(1.0)}], weights=[0.1, 0.2])
 
     def test_subset_preserves_metadata(self):
         from src.llm.task_vector import TaskVector
 
         container = TaskVector(
-            [{"a": [1.0]}, {"a": [2.0]}, {"a": [3.0]}],
+            [{"a": _Number(1.0)}, {"a": _Number(2.0)}, {"a": _Number(3.0)}],
             weights=[0.1, 0.2, 0.3],
             rounds=[1, 2, 3],
         )
@@ -306,7 +377,8 @@ class TestTrimElectMerge:
         torch = require_torch()
         from src.llm.ties_merge import TiesMerger
 
-        merger = TiesMerger(trim_percent=0.0, alpha=0.5, merge_all_checkpoints=False)
+        # trim_percent=100 表示"不修剪"（该参数是**保留**百分比，取值 (0, 100]）
+        merger = TiesMerger(trim_percent=100.0, alpha=0.5, merge_all_checkpoints=False)
         merger.add({"w": torch.tensor([1.0, 1.0])}, weight=1.0, round_index=1)
         merger.add({"w": torch.tensor([2.0, 2.0])}, weight=1.0, round_index=2)
         merged, report, scaling = merger.merge()

@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pytest
 
+from tests.conftest import require_torch
 from src.training.joint_trainer import (
     AlignmentState,
     JointAlignmentTrainer,
@@ -365,49 +366,47 @@ class TestFinetuneAndMerge:
         assert backend.applied == []
 
     def test_merge_apply_uses_equation_7_scaling(self):
-        """scaling = (1-α)·λ_m + α·λ_{m-1}。"""
+        """scaling = (1-α)·λ_m + α·λ_{m-1}，且用的是**周期级** λ。
+
+        本用例需要 torch（Algorithm 1 的修剪依赖 ``torch.quantile``），
+        因此在无 torch 环境下会被跳过。
+
+        为了让断言真正能区分"周期级 vs epoch 级"，这里做**两次** λ 更新：
+        第一次后 epoch 级 (λ_cur, λ_prev) = (0.91, 1.0)，
+        第二次后变成 (0.901, 0.91)。周期级快照停在最新值，
+        而 ``lambda_cycle_previous`` 只有经过一次合并才会推进到 0.901——
+        因此"用 epoch 级 λ"与"用周期级 λ"会给出不同的 scaling，
+        断言才有鉴别力（只做一次更新时两者恰好相等，测试会假通过）。
+        """
+        torch = require_torch()
         backend = StubBackend()
         trainer = build_trainer(llm_backend=backend, momentum_beta=0.9, lambda_init=1.0)
-        # 先让 λ 变化：λ = 0.9*0.9 + 0.1*1.0 = 0.91，λ_prev = 1.0
-        trainer.update_lambda(0.9)
-        # 手工塞入一个任务向量（模拟已完成一轮微调）
-        import src.llm.task_vector as task_vector_module
+        trainer.update_lambda(0.9)   # λ = 0.91， λ_prev(epoch) = 1.0
+        trainer.update_lambda(0.9)   # λ = 0.901，λ_prev(epoch) = 0.91
+        assert trainer.state.lambda_current == pytest.approx(0.901, abs=1e-12)
+        assert trainer.state.lambda_previous == pytest.approx(0.91, abs=1e-12)
+        # 周期级：当前值 = 最新的 λ，历史值仍是 λ_0（还没合并过）
+        assert trainer.lambda_cycle == pytest.approx(0.901, abs=1e-12)
+        assert trainer.lambda_cycle_previous == pytest.approx(1.0, abs=1e-12)
 
-        class _FakeTensor(float):
-            def numel(self) -> int:
-                return 1
-
-            def __ne__(self, other):  # noqa: D105
-                return _FakeBool(super().__ne__(other))
-
-            def __eq__(self, other):  # noqa: D105
-                return _FakeBool(super().__eq__(other))
-
-            def sum(self):  # pragma: no cover - 仅用于报告统计
-                return self
-
-            def item(self) -> float:
-                return float(self)
-
-            def detach(self):
-                return self
-
-        class _FakeBool:
-            def __init__(self, value: bool):
-                self.value = value
-
-            def sum(self):
-                return _FakeTensor(1.0 if self.value else 0.0)
-
-        trainer.merger.add({"w": _FakeTensor(1.0)}, weight=trainer.state.omega, round_index=1)
+        trainer.merger.add(
+            {"w": torch.tensor([1.0, 2.0])}, weight=trainer.omega_cycle, round_index=1
+        )
         info = trainer.merge_and_apply(round_index=1, epoch=5)
 
         assert info["applied"] is True
-        assert len(backend.applied) == 1
         alpha = trainer.merger.alpha
-        expected = (1 - alpha) * trainer.merger.lambda_current + alpha * trainer.merger.lambda_previous
-        assert backend.applied[0]["scaling"] == pytest.approx(expected, abs=1e-12)
-        assert info["scaling"] == pytest.approx(expected, abs=1e-12)
+        expected_cycle = (1 - alpha) * 0.901 + alpha * 1.0
+        expected_epoch = (1 - alpha) * 0.901 + alpha * 0.91
+        assert backend.applied[0]["scaling"] == pytest.approx(expected_cycle, abs=1e-12)
+        # 两者必须可区分，否则这条测试没有鉴别力
+        assert abs(expected_cycle - expected_epoch) > 1e-3
+
+        # 合并后周期历史推进：下一次合并的 λ_previous 应是本轮的周期 λ
+        assert trainer.lambda_cycle_previous == pytest.approx(0.901, abs=1e-12)
+        # epoch 级 λ 被原样恢复，继续供式(8) 使用
+        assert trainer.merger.lambda_current == pytest.approx(0.901, abs=1e-12)
+        assert trainer.merger.lambda_previous == pytest.approx(0.91, abs=1e-12)
 
     def test_merge_skipped_without_task_vectors(self):
         backend = StubBackend()
@@ -579,7 +578,19 @@ class TestScoreHelpers:
         assert compute_omega(-5.0, 0.1, 0.9) == pytest.approx(0.1)
         assert compute_omega(5.0, 0.1, 0.9) == pytest.approx(0.9)
 
-    def test_lambda_score_nan_is_handled(self):
-        """指标为 NaN 时不应把 NaN 传进 λ（会让后续 ω、scaling 全变 NaN）。"""
+    def test_lambda_score_nan_returns_finite(self):
+        """指标为 NaN 时绝不能把 NaN 传进 λ（否则 ω、scaling 全变 NaN）。
+
+        实现里通过 ``min(1.0, max(0.0, nan))`` 把 NaN 收敛为 0.0，因此这里断言
+        **结果有限**——而不是"有限或为 NaN"那种恒真的写法。
+        """
         score = compute_lambda_score({"acc": float("nan")}, "contrastive_accuracy")
-        assert math.isfinite(score) or math.isnan(score)
+        assert math.isfinite(score), f"NaN 指标应被收敛为有限值，实际 {score}"
+        assert score == 0.0
+
+    def test_lambda_score_infinite_is_clipped(self):
+        import math as _math
+
+        assert compute_lambda_score({"acc": float("inf")}, "contrastive_accuracy") == 1.0
+        assert compute_lambda_score({"acc": float("-inf")}, "contrastive_accuracy") == 0.0
+        assert _math.isfinite(compute_lambda_score({"loss": float("inf")}, "inverse_loss"))

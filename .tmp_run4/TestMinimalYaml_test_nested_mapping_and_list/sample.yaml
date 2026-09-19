@@ -1,0 +1,10 @@
+# comment
+top: 1
+nested:
+  a: true
+  b: 2.5
+list:
+  - one
+  - two
+inline: [x, y]
+empty_string: ""

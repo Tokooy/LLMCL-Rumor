@@ -9,12 +9,17 @@
 
 * 嵌套映射（靠缩进）
 * 空列表项 ``- ../base.yaml``（字符串列表）
-* 行内流式列表 ``[a, b, c]``
+* 行内流式列表 ``[a, b, c]`` 与行内流式映射 ``{}`` / ``{a: 1}``
 * 标量：整数、浮点、布尔、``null``、``""``、引号字符串、普通字符串
 * 以 ``#`` 开头的注释与行尾注释
 
 **它不支持的**（本项目配置里也没用）：多行字符串 ``|``/``>``、
-锚点与别名 ``&``/``*``、复杂键 ``?``、流式映射 ``{}``、重复键合并 ``<<``。
+锚点与别名 ``&``/``*``、复杂键 ``?``、重复键合并 ``<<``。
+
+> 流式映射必须支持：``configs/base.yaml`` 里就有 ``extra_body: {}``，
+> 早期版本把 ``{}`` 当普通字符串返回，导致 ``dict(cfg.get_path("llm.api.extra_body"))``
+> 抛 ``ValueError``——而这只在**没有 pyyaml** 的机器上出现（pyyaml 会正确解析成空字典），
+> 属于典型的"回退实现悄悄跑偏"。
 
 正确的用法是"有 pyyaml 就用 pyyaml"
 ------------------------------------
@@ -82,6 +87,17 @@ def _parse_scalar(text: str) -> Any:
         if not inner:
             return []
         return [_parse_scalar(item) for item in _split_flow(inner)]
+
+    # 流式映射（如 `{}` 或 `{a: 1, b: 2}`）
+    if value.startswith("{") and value.endswith("}"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return {}
+        mapping: Dict[str, Any] = {}
+        for item in _split_flow(inner):
+            key, _, item_value = item.partition(":")
+            mapping[key.strip().strip("'\"")] = _parse_scalar(item_value)
+        return mapping
 
     # 数字
     try:

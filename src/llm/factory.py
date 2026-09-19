@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from src.utils.config import Config
 
@@ -38,6 +38,28 @@ BACKENDS = {
 }
 
 
+def _as_mapping(value: Any, key: str) -> Dict[str, Any]:
+    """把配置值安全地转成 dict。
+
+    配置里的 ``extra_body`` / ``label_descriptions`` 这类字段，写法可能是
+    空流式映射 ``{}``。极端情况下（例如手改配置写错）会拿到字符串或列表，
+    此时直接 ``dict(...)`` 会抛出难以定位的 ValueError。
+    这里统一做一次类型检查，并给出指明配置键的报错。
+    """
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text in ("", "{}"):
+            return {}
+    raise ValueError(
+        f"配置项 {key} 必须是映射（例如 extra_body: {{}}），"
+        f"实际拿到 {type(value).__name__}: {value!r}"
+    )
+
+
 def resolve_label_descriptions(config: Config) -> dict:
     """读取标签描述；缺失时给出论文默认的英文描述。
 
@@ -50,7 +72,10 @@ def resolve_label_descriptions(config: Config) -> dict:
         "TR": "true rumor (verified as true information)",
         "UR": "unverified rumor (truthfulness not yet determined)",
     }
-    configured = config.get_path("llm.prompt.label_descriptions", {}) or {}
+    configured = _as_mapping(
+        config.get_path("llm.prompt.label_descriptions", {}),
+        "llm.prompt.label_descriptions",
+    )
     defaults.update({str(key): str(value) for key, value in configured.items()})
     return defaults
 
@@ -93,7 +118,7 @@ def build_backend(config: Config, backend_name: Optional[str] = None) -> LLMBack
             timeout=float(config.get_path("llm.api.timeout", 120)),
             max_retries=int(config.get_path("llm.api.max_retries", 3)),
             generation=generation,
-            extra_body=dict(config.get_path("llm.api.extra_body", {}) or {}),
+            extra_body=_as_mapping(config.get_path("llm.api.extra_body", {}), "llm.api.extra_body"),
         )
 
     if backend_cls is DemoBackend:
@@ -133,6 +158,17 @@ def build_augmentor(
 ) -> Augmentor:
     """装配一个可直接使用的 :class:`Augmentor`。
 
+    关于并发数：它同时承担两个含义，因此这里按后端类型分别决定。
+
+    * **api 后端**：每个请求独立发往服务端，并发越高吞吐越大 →
+      直接取 ``llm.augmentation.batch_size``；
+    * **transformers 后端**：后端自己已经按批次生成（见
+      :meth:`src.llm.hf_backend.HFBackend.generate`），
+      若再开线程池，多个线程会并发跑前向、各自持有 KV cache，
+      在单卡 24GB 上很容易 OOM。因此**强制串行**（``concurrency=1``），
+      批大小由 ``llm.augmentation.batch_size`` 控制。
+      若显式传入 ``overrides['concurrency']``，则尊重调用方的选择。
+
     Args:
         config: 全局配置。
         backend: 复用已有后端（例如训练循环里已经加载好的模型）；
@@ -144,6 +180,24 @@ def build_augmentor(
     overrides = dict(overrides or {})
     backend = backend or build_backend(config, overrides.pop("backend", None))
     prompt_builder = build_prompt_builder(config, template_file=template_file)
+
+    # 注意：必须先记录"调用方是否显式给了 concurrency"，再取值——
+    # 早期写法先 pop 再判断 `"concurrency" not in overrides`，
+    # 那个条件永远为 False，导致显式覆盖被静默忽略。
+    has_explicit_concurrency = "concurrency" in overrides
+    requested_concurrency = overrides.pop(
+        "concurrency", config.get_path("llm.augmentation.batch_size", 4)
+    )
+    if getattr(backend, "supports_finetuning", False) and not has_explicit_concurrency:
+        # 本地 transformers 后端：内部已批处理，串行即可，避免并发前向打爆显存
+        effective_concurrency = 1
+        if logger is not None and int(requested_concurrency) != 1:
+            logger.info(
+                f"transformers 后端已内置批处理，并发数由 {requested_concurrency} 调整为 1"
+                "（批大小见 llm.augmentation.batch_size），以避免并发前向导致显存溢出"
+            )
+    else:
+        effective_concurrency = int(requested_concurrency)
 
     return Augmentor(
         backend=backend,
@@ -158,9 +212,8 @@ def build_augmentor(
         strict_format=bool(overrides.get(
             "strict_format", config.get_path("llm.augmentation.strict_format", True)
         )),
-        concurrency=int(overrides.get(
-            "concurrency", config.get_path("llm.augmentation.batch_size", 4)
-        )),
+        concurrency=effective_concurrency,
+        batch_size=int(config.get_path("llm.augmentation.batch_size", 4)),
         overlap_max=float(overrides.get(
             "overlap_max", config.get_path("llm.augmentation.overlap_max", 0.75)
         )),

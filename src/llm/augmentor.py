@@ -91,6 +91,7 @@ class Augmentor:
         copies_per_sample: int = 1,
         strict_format: bool = True,
         concurrency: int = 1,
+        batch_size: int = 4,
         semantic_encoder: Optional[Any] = None,
         overlap_max: float = 0.75,
         temperature_jitter: float = 0.0,
@@ -105,6 +106,9 @@ class Augmentor:
         self.copies_per_sample = max(1, int(copies_per_sample))
         self.strict_format = bool(strict_format)
         self.concurrency = max(1, int(concurrency))
+        #: 串行路径下每次交给后端的 Prompt 条数。
+        #: 只有 >1 时 transformers 后端才能真正分批前向，温度分档也才有意义。
+        self.batch_size = max(1, int(batch_size))
         self.semantic_encoder = semantic_encoder
         self.overlap_max = float(overlap_max)
         self.temperature_jitter = float(temperature_jitter)
@@ -182,10 +186,23 @@ class Augmentor:
             self._log(f"写入增强缓存失败（不影响流程）：{exc}", level="warning")
 
     # ------------------------------------------------------------------ #
-    # 单条样本
+    # Prompt 渲染 / 单条 / 成批
+    # ------------------------------------------------------------------ #
+    def _build_specs(
+        self, instance: DataInstance, copy_index: int
+    ) -> Tuple[PromptSpec, str]:
+        """渲染一条样本的 Prompt 并算出缓存键。"""
+        spec = self.prompt_builder.build(
+            instance, temperature_hint=self.temperature_jitter * ((copy_index % 3) - 1)
+        )
+        cache_key = self._cache_key(spec.prompt_hash, copy_index, self.backend.model_name)
+        return spec, cache_key
+
+    # ------------------------------------------------------------------ #
+    # 单条 / 成批
     # ------------------------------------------------------------------ #
     def _augment_one(self, instance: DataInstance, copy_index: int) -> Tuple[DataInstance, bool, bool]:
-        """增强一条样本的一份副本。
+        """增强一条样本的一份副本（单条路径，供并发模式使用）。
 
         流程：渲染 Prompt → 查缓存 → 缺失则调用后端（失败/解析失败按
         ``max_retries`` 重试）→ 质量校验 → 合并成新实例。
@@ -193,42 +210,108 @@ class Augmentor:
         Returns:
             ``(增强后的实例, 是否命中缓存, 是否成功)``。
         """
-        spec = self.prompt_builder.build(
-            instance, temperature_hint=self.temperature_jitter * ((copy_index % 3) - 1)
-        )
-        cache_key = self._cache_key(spec.prompt_hash, copy_index, self.backend.model_name)
+        spec, _cache_key = self._build_specs(instance, copy_index)
+        bundle = self._process_specs([(instance, copy_index, spec)])
+        return bundle[0]
 
-        cached_text = self._read_cache(cache_key)
-        if cached_text is not None:
-            return self._finalize(instance, cached_text, spec, from_cache=True), True, True
+    def _process_specs(
+        self,
+        items: Sequence[Tuple[DataInstance, int, PromptSpec]],
+    ) -> List[Tuple[DataInstance, bool, bool]]:
+        """成批处理若干 ``(实例, 副本号, Prompt)``，**同一批只调用一次后端**。
 
-        last_problems: List[str] = []
-        for _attempt in range(self.max_retries):
-            results: List[GenerationResult] = self.backend.generate([spec])
-            result = results[0] if results else GenerationResult(
-                uid=instance.uid, prompt_hash=spec.prompt_hash, error="后端未返回结果"
+        这是"真正批处理"的落点：把一组的 Prompt 一次性交给后端
+        （``HFBackend.generate`` 会按温度档再分组并批量前向），
+        而不是一条一条地调 ``generate([spec])``。
+        只有当调用方把多条 Prompt 一起传进来时，温度分档才有意义。
+
+        返回顺序与输入严格一致。
+        """
+        results: List[Optional[Tuple[DataInstance, bool, bool]]] = [None] * len(items)
+
+        # ---- 1) 先尽量用缓存，只把未命中的送去生成 ----
+        pending: List[int] = []
+        pending_specs: List[PromptSpec] = []
+        for position, (instance, _copy_index, spec) in enumerate(items):
+            cache_key = self._cache_key(
+                spec.prompt_hash, _copy_index, self.backend.model_name
             )
-            if not result.ok:
-                last_problems = [f"生成失败：{result.error}"]
+            cached_text = self._read_cache(cache_key)
+            if cached_text is not None:
+                results[position] = (
+                    self._finalize(instance, cached_text, spec, from_cache=True),
+                    True,
+                    True,
+                )
+            else:
+                pending.append(position)
+                pending_specs.append(spec)
+
+        if not pending:
+            return [item for item in results if item is not None]
+
+        # ---- 2) 成批生成（失败/校验不过则按剩余集合重试）----
+        attempts = {position: 0 for position in pending}
+        problems: Dict[int, List[str]] = {position: [] for position in pending}
+        texts: Dict[int, str] = {}
+
+        active = list(pending)
+        for _round in range(self.max_retries):
+            if not active:
+                break
+            specs = [items[position][2] for position in active]
+            generated = self.backend.generate(specs)
+            next_active: List[int] = []
+            for offset, position in enumerate(active):
+                instance, copy_index, spec = items[position]
+                result = generated[offset] if offset < len(generated) else None
+                if result is None or not result.ok:
+                    problems[position] = [
+                        f"生成失败：{result.error if result else '后端未返回结果'}"
+                    ]
+                    attempts[position] += 1
+                    if attempts[position] < self.max_retries:
+                        next_active.append(position)
+                    continue
+
+                final = self._finalize(instance, result.text, spec, from_cache=False)
+                quality = final.quality or {}
+                if quality.get("structure_ok") and (
+                    not self.strict_format or quality.get("semantic_ok", True)
+                ):
+                    # 只有通过校验的结果才写缓存，避免坏结果被永久复用
+                    self._write_cache(
+                        self._cache_key(spec.prompt_hash, copy_index, self.backend.model_name),
+                        spec,
+                        result.text,
+                    )
+                    results[position] = (final, False, True)
+                else:
+                    problems[position] = list(quality.get("problems", [])) + list(
+                        quality.get("warnings", [])
+                    )
+                    attempts[position] += 1
+                    if attempts[position] < self.max_retries:
+                        next_active.append(position)
+            active = next_active
+
+        # ---- 3) 仍然失败的：产出"未增强副本" ----
+        for position in pending:
+            if results[position] is not None:
                 continue
+            instance, copy_index, spec = items[position]
+            self._log(
+                f"样本 {instance.uid} 第 {copy_index + 1} 份增强失败，"
+                f"已重试 {self.max_retries} 次：{problems[position][:2]}",
+                level="warning",
+            )
+            results[position] = (
+                self._failed_copy(instance, spec, problems[position]),
+                False,
+                False,
+            )
 
-            final = self._finalize(instance, result.text, spec, from_cache=False)
-            quality = final.quality or {}
-            if quality.get("structure_ok") and (
-                not self.strict_format or quality.get("semantic_ok", True)
-            ):
-                # 只有通过校验的结果才写缓存，避免坏结果被永久复用
-                self._write_cache(cache_key, spec, result.text)
-                return final, False, True
-
-            last_problems = list(quality.get("problems", [])) + list(quality.get("warnings", []))
-
-        self._log(
-            f"样本 {instance.uid} 第 {copy_index + 1} 份增强失败，已重试 {self.max_retries} 次："
-            f"{last_problems[:2]}",
-            level="warning",
-        )
-        return self._failed_copy(instance, spec, last_problems), False, False
+        return [item for item in results if item is not None]
 
     def _drop_cache(self, key: str) -> None:
         if not self.cache_dir:
@@ -333,19 +416,30 @@ class Augmentor:
         with_cached: List[bool] = []
 
         if self.concurrency <= 1 or len(tasks) <= 1:
-            for index, (instance, copy_index) in enumerate(tasks):
-                augmented, cached, ok = self._augment_one(instance, copy_index)
-                results.append(augmented)
-                with_cached.append(cached)
-                if ok:
-                    stats.succeeded += 1
-                else:
-                    stats.failed += 1
-                    stats.retried += self.max_retries
-                if progress_every and (index + 1) % progress_every == 0:
-                    self._log(f"增强进度 {index + 1}/{len(tasks)}")
+            # 串行路径：按 chunk 成批送后端。这是本地 transformers 后端的默认路径，
+            # 也是"温度分档 + 真正批处理"生效的地方——只有一次传入多条 Prompt，
+            # HFBackend 才能按 base-jitter / base / base+jitter 分成三批前向。
+            chunk = max(1, self.batch_size)
+            for start in range(0, len(tasks), chunk):
+                group = tasks[start : start + chunk]
+                items = [
+                    (instance, copy_index, self._build_specs(instance, copy_index)[0])
+                    for instance, copy_index in group
+                ]
+                for augmented, cached, ok in self._process_specs(items):
+                    results.append(augmented)
+                    with_cached.append(cached)
+                    if ok:
+                        stats.succeeded += 1
+                    else:
+                        stats.failed += 1
+                        stats.retried += self.max_retries
+                if progress_every and len(results) % progress_every < chunk:
+                    self._log(f"增强进度 {len(results)}/{len(tasks)}")
         else:
-            # 线程池只负责并发发请求；每个任务本身是独立的（无共享可变状态）
+            # 并发路径（api 后端）：每个任务独立发请求，线程池负责吞吐。
+            # 注意此时每条请求仍然是单条 Prompt——服务端自己做批处理，
+            # 客户端的并发度就是吞吐来源。
             with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
                 futures = {
                     pool.submit(self._augment_one, instance, copy_index): (instance, copy_index)

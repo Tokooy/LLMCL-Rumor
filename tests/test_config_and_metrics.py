@@ -287,16 +287,26 @@ class TestMetrics:
         # 关键区别在于论文的 Avg F1 与 macro avg 完全一致，这条在实现里有断言。
 
     def test_avg_f1_is_macro_not_weighted(self):
-        """各类样本数不同时，Avg F1（宏平均）必须与加权 F1 不同。"""
+        """Avg F1 必须是**宏平均**：各类样本数悬殊时它与加权 F1 明显不同。
+
+        构造：多数类（NR，100 条）全部预测错 → 该类 F1 = 0；
+        少数类（UR，10 条）全部预测对 → F1 = 1。
+        此时宏平均 = (0+0+0+1)/4 = 0.25，
+        而按样本数加权 = (100×0 + 10×1)/110 ≈ 0.0909 —— **加权值更小**。
+        因此这里断言宏平均 **大于** 加权平均；两个口径的差异正是要钉住的东西。
+        """
         from src.training.evaluate import classification_metrics
 
-        # NR 很多且全预测错、UR 很少且全预测对 → 加权平均明显高于宏平均
         references = [0] * 100 + [3] * 10
         predictions = [1] * 100 + [3] * 10
         metrics = classification_metrics(predictions, references)
-        assert metrics["avg_f1"] < metrics["weighted_f1"]
+
         per_class = [metrics["per_class"][label]["f1"] for label in ("NR", "FR", "TR", "UR")]
         assert metrics["avg_f1"] == pytest.approx(sum(per_class) / 4, abs=1e-9)
+        assert metrics["avg_f1"] == pytest.approx(0.25, abs=1e-9)
+        # 加权平均被多数类（F1=0）拉低
+        assert metrics["weighted_f1"] == pytest.approx(10 / 110, abs=1e-9)
+        assert metrics["avg_f1"] > metrics["weighted_f1"]
 
     def test_perfect_prediction(self):
         from src.training.evaluate import classification_metrics

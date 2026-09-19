@@ -53,30 +53,43 @@ DEFAULT_LENGTH_RATIO_RANGE: Tuple[float, float] = (0.5, 2.5)
 # 推理型模型可能输出的思考块，必须剥掉
 _THINK_TAGS = ("think", "thinking", "reasoning", "analysis")
 
-# 推理块的**闭合**标签在各模型里写法不同，实测至少三种：
-#   DeepSeek-R1 等：   thinking ... <｜end▁of▁thinking｜>
-#   Qwen3 等：         thinking ... <｜end▁of▁thinking｜>          （闭合标签自带前缀，不是 </think>）
-#   Harmony 风格：    <|channel|>analysis<|message|> ... <|end|>
-# 只写 `</{tag}>` 只能匹配第一种，对 Qwen 会完全失效——那时抽取只能靠括号扫描，
-# 而思考过程里经常出现示例 JSON，扫描可能抽出错误对象。
+# 推理块的闭合标签在各模型/各 API 上写法不同，实测至少三类：
+#   1) 标准开闭对：      "<" + "think> 推理过程 " + "</" + "think>"
+#   2) **只有闭合标签**（推理 API 常见，开标签被服务端吃掉）：
+#      正文里只剩 "<" + "｜end▁of▁thinking｜>"，竖向分隔符有半角 "|" 与全角 "｜" 两种
+#   3) Harmony 风格：    "<|channel|>analysis<|message|> ... <|end|>"
+# 只写 `</{tag}>` 对第 2 类完全失效——那时抽取只能靠括号扫描，
+# 而思考过程里经常出现示例 JSON，扫描会抽出错误对象。
+#
+# ⚠️ 注意：这些字符串**不能**直接写成字面量的尖括号形式去描述，
+# 因为某些文本处理链路会把看似 XML 标签的片段吃掉。规则里一律用转义写法构造。
 _THINK_BLOCK_PATTERNS = (
-    r"<{tag}>.*?</{tag}\s*>",              # </think>（允许闭合标签内有空白）
+    r"<{tag}>.*?</{tag}\s*>",              # 标准开闭对
     r"<\|{tag}\|>.*?<\|end\|>",            # <|think|> ... <|end|>
     r"<\|channel\|>\s*{tag}\s*<\|message\|>.*?<\|end\|>",   # Harmony 风格
 )
+
+#: 只有闭合标签的形态（推理 API 常见：开标签被服务端吃掉，正文里只剩闭合标签）。
+#: 竖向分隔符有半角 ``|`` 与全角 ``｜`` 两种写法。
+#: 不参与 ``.format(tag=...)``，因为里面的大括号会被当成格式占位符。
+_CLOSE_ONLY_PATTERN = (
+    r"<[/\u005c]?[|\uff5c][^<>\n]{0,40}[|\uff5c]\s*>"
+)
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*|\s*```\s*$")
+_CLOSE_ONLY_RE = re.compile(_CLOSE_ONLY_PATTERN, re.IGNORECASE)
 
 
 def _think_block_regex(tag: str) -> re.Pattern:
     """把某个思考块标签的所有已知写法编译成一个正则。
 
-    不同写法的闭合标签差异很大（``</think>`` vs ``</think>`` vs ``<|end|>``），
+    不同写法的闭合标签差异很大（``</think>`` 与 ``<｜end▁of▁thinking｜>``），
     因此把候选模式用 ``|`` 连起来，一次性替换掉所有形态。
     """
-    alternatives = "|".join(
+    alternatives = [
         pattern.format(tag=re.escape(tag)) for pattern in _THINK_BLOCK_PATTERNS
-    )
-    return re.compile(f"(?:{alternatives})", re.DOTALL | re.IGNORECASE)
+    ]
+    alternatives.append(_CLOSE_ONLY_PATTERN)
+    return re.compile("(?:" + "|".join(alternatives) + ")", re.DOTALL | re.IGNORECASE)
 
 
 _THINK_REGEXES = tuple(_think_block_regex(tag) for tag in _THINK_TAGS)
@@ -85,29 +98,60 @@ _THINK_REGEXES = tuple(_think_block_regex(tag) for tag in _THINK_TAGS)
 # ---------------------------------------------------------------------- #
 # 文本清洗与 JSON 抽取
 # ---------------------------------------------------------------------- #
+def _has_json(text: str) -> bool:
+    """文本中是否含可解析的 JSON 对象。"""
+    try:
+        extract_json_object(text)
+    except ValueError:
+        return False
+    return True
+
+
 def strip_wrappers(text: str) -> str:
-    """剥掉 markdown 代码围栏与推理模型的思考块。"""
+    """剥掉 markdown 代码围栏与推理模型的思考块。
+
+    处理顺序（每一步都只在"结果仍然含有 JSON"时才采纳，避免把答案一起丢掉）：
+
+    1. 剥 ``` 围栏；
+    2. 剥**成对**的思考块（含三种已知写法）；
+    3. 处理**只有闭合标签**的形态：闭合标签之前是思考过程、之后才是答案，
+       若"闭合标签之后"能解析出 JSON，就整段替换为之后的部分。
+       这一步是必要的——真实推理 API 常把开标签吃掉，只剩
+       ``<｜end▁of▁thinking｜>``；此时思考过程里的示例 JSON 会排在答案前面，
+       只删标签的话括号扫描会抽到思考过程里的那个诱饵对象；
+    4. 兜底：出现未知写法的 ``<think>`` 开标签时，若"标签之前"能解析出 JSON
+       就只保留之前的部分。
+    """
     if not text:
         return ""
     result = text.strip()
 
-    # 剥 ```json ... ```
+    # 1) 剥 ```json ... ```
     if result.startswith("```"):
         result = _FENCE_RE.sub("", result, count=1)
         result = _FENCE_RE.sub("", result, count=1)
         result = result.strip()
 
-    # 剥思考块（含 Qwen 的 </think> 写法）
+    # 2) 剥成对思考块
     for regex in _THINK_REGEXES:
         result = regex.sub("", result).strip()
 
-    # 兜底：闭合标签写成了非标准形态时，"<tag>" 之后到文本末尾的整段都不可信，
-    # 但如果剥掉后什么都不剩，说明真正的答案就在里面，此时保留原文交给 JSON 扫描。
+    # 3) 只有闭合标签：保留标签之后的内容
+    close_match = None
+    for match in _CLOSE_ONLY_RE.finditer(result):
+        close_match = match  # 取最后一个
+    if close_match is not None:
+        after = result[close_match.end():].strip()
+        if after and _has_json(after):
+            result = after
+
+    # 4) 兜底：未知写法的开标签 → 若标签之前有 JSON，只保留之前的部分
     for tag in _THINK_TAGS:
-        if f"<{tag}>" in result:
-            candidate = result.split(f"<{tag}>")[0].strip()
-            if candidate:
-                result = candidate
+        if f"<{tag}>" not in result:
+            continue
+        candidate = result.split(f"<{tag}>")[0].strip()
+        if candidate and _has_json(candidate):
+            result = candidate
 
     # 剥常见前缀
     for prefix in ("Output:", "OUTPUT:", "Result:", "Answer:", "JSON:"):
@@ -117,33 +161,15 @@ def strip_wrappers(text: str) -> str:
     return result
 
 
-def extract_json_object(text: str) -> Dict[str, Any]:
-    """从模型输出中抽出第一个完整的 JSON 对象。
-
-    实现方式是按括号配对扫描并逐字符尝试 ``json.loads``，这样即使模型在 JSON
-    前后夹了说明文字也能正确抽取（比正则更稳）。
-
-    Raises:
-        ValueError: 找不到可解析的 JSON 对象。
-    """
-    cleaned = strip_wrappers(text)
-    if not cleaned:
-        raise ValueError("模型输出为空")
-
-    # 快路径：整体就是 JSON
-    try:
-        payload = json.loads(cleaned)
-        if isinstance(payload, Mapping):
-            return dict(payload)
-    except json.JSONDecodeError:
-        pass
-
+def _scan_json_objects(text: str) -> List[str]:
+    """按括号配对扫描出文本中所有**顶层** JSON 对象字面量（按出现顺序）。"""
+    candidates: List[str] = []
     start: Optional[int] = None
     depth = 0
     in_string = False
     escaped = False
 
-    for index, char in enumerate(cleaned):
+    for index, char in enumerate(text):
         if in_string:
             if escaped:
                 escaped = False
@@ -163,27 +189,111 @@ def extract_json_object(text: str) -> Dict[str, Any]:
             if depth > 0:
                 depth -= 1
                 if depth == 0 and start is not None:
-                    candidate = cleaned[start : index + 1]
+                    candidate = text[start : index + 1]
                     try:
                         payload = json.loads(candidate)
                     except json.JSONDecodeError:
                         start = None
                         continue
                     if isinstance(payload, Mapping):
-                        return dict(payload)
+                        candidates.append(candidate)
                     start = None
+    return candidates
 
-    raise ValueError("模型输出中找不到合法的 JSON 对象")
+
+def _load_json_objects(text: str) -> List[Dict[str, Any]]:
+    """把 :func:`_scan_json_objects` 的结果解析成 dict 列表。"""
+    objects: List[Dict[str, Any]] = []
+    for candidate in _scan_json_objects(text):
+        try:
+            objects.append(json.loads(candidate))
+        except json.JSONDecodeError:  # pragma: no cover - 扫描已保证可解析
+            continue
+    return objects
+
+
+def extract_json_object(text: str, prefer_last: bool = False) -> Dict[str, Any]:
+    """从模型输出中抽出第一个（或最后一个）完整的 JSON 对象。
+
+    实现方式是按括号配对扫描并逐字符尝试 ``json.loads``，这样即使模型在 JSON
+    前后夹了说明文字也能正确抽取（比正则更稳）。
+
+    Args:
+        text: 模型原始输出。
+        prefer_last: 为 True 时返回**最后一个**候选对象。
+
+    Note:
+        推理型模型的输出结构是"思考过程 → 答案"，而思考过程里经常出现示例 JSON。
+        此时"最后一个对象"才是答案，因此 :func:`parse_augmentation_response`
+        会在第一个对象缺少必需字段时改用最后一个。
+
+    Raises:
+        ValueError: 找不到可解析的 JSON 对象。
+    """
+    cleaned = strip_wrappers(text)
+    if not cleaned:
+        raise ValueError("模型输出为空")
+
+    # 快路径：整体就是 JSON
+    try:
+        payload = json.loads(cleaned)
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    except json.JSONDecodeError:
+        pass
+
+    candidates = _load_json_objects(cleaned)
+    if not candidates:
+        raise ValueError("模型输出中找不到合法的 JSON 对象")
+    return candidates[-1] if prefer_last else candidates[0]
 
 
 def parse_augmentation_response(text: str) -> Dict[str, Any]:
     """解析并做基础字段检查，返回 ``{uid, string_value, replies}``。
 
+    **JSON 抽取策略：优先取最后一个顶层 JSON 对象。**
+
+    理由：推理型模型的输出结构是"思考过程 → 答案"，而思考过程里经常出现
+    **格式完全合法的示例 JSON**（例如"Example of the required shape: {...}"）。
+    这类诱饵与真答案在字段上无法区分——两者都有 ``uid`` / ``string_value`` /
+    ``replies`` 且都能通过结构校验。唯一的稳定判据是**位置**：
+
+    * 约定"答案写在最后" → 取最后一个候选；
+    * 若最后一个候选校验失败（缺字段等），则依次回退到其它候选
+      （按"从后往前"的顺序），因此单对象、纯 JSON、前后夹说明文字等
+      常见形态都不受影响。
+
     Raises:
         ValueError: JSON 非法、字段缺失或字段类型不对。
     """
-    payload = extract_json_object(text)
+    cleaned = strip_wrappers(text)
+    candidates = _load_json_objects(cleaned)
 
+    # 整体就是 JSON 的情况（清洗后可能只剩一个对象，扫描不到时兜底再试一次）
+    if not candidates:
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"模型输出中找不到合法的 JSON 对象：{exc}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError("模型输出的顶层结构不是 JSON 对象")
+        candidates = [dict(payload)]
+
+    if not candidates:
+        raise ValueError("模型输出中找不到合法的 JSON 对象")
+
+    # 从后往前尝试：最后一个是答案，前面的是思考过程里的示例
+    last_error: Optional[Exception] = None
+    for payload in reversed(candidates):
+        try:
+            return _validate_augmentation_payload(payload)
+        except ValueError as exc:
+            last_error = exc
+    raise last_error if last_error is not None else ValueError("模型输出无有效 JSON 对象")
+
+
+def _validate_augmentation_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """校验单个候选对象是否是合格的增强结果。"""
     if "string_value" not in payload:
         # 容错：有些模型会把结果藏在 data/result/output 里
         for key in ("data", "result", "output", "augmented", "rewritten"):

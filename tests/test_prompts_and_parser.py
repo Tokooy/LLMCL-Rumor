@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -395,6 +396,83 @@ class TestMergeAugmentation:
         payload = instance.prompt_payload()
         augmented = merge_augmentation(instance, payload)
         assert augmented.replies[0].uid == instance.replies[0].uid
+
+
+# ===================================================================== #
+# 增强器装配（并发策略）
+# ===================================================================== #
+class TestAugmentorFactory:
+    """``build_augmentor`` 的并发决策：不同后端应有不同的默认值。
+
+    背景：``llm.augmentation.batch_size`` 对两种后端含义不同——
+    api 后端是"并发请求数"，而 transformers 后端内部已经**分批**生成，
+    再叠加线程池会让多个线程同时跑前向、各自持有 KV cache，单卡 24GB 极易 OOM。
+    因此默认策略是：支持微调的后端（本地权重）→ 串行；其余 → 按 batch_size。
+    但**显式传入的 concurrency 必须被尊重**（早期实现先 pop 再判断 key，
+    条件恒为 False，显式覆盖被静默忽略）。
+    """
+
+    def test_local_backend_defaults_to_serial(self):
+        from src.llm.factory import build_augmentor
+        from src.utils.config import load_config
+
+        config = load_config(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", "base.yaml",
+            )
+        )
+        augmentor = build_augmentor(
+            config, overrides={"backend": "transformers", "max_retries": 1}
+        )
+        assert augmentor.concurrency == 1
+        assert augmentor.backend.supports_finetuning is True
+
+    def test_api_backend_keeps_configured_concurrency(self):
+        from src.llm.factory import build_augmentor
+        from src.utils.config import load_config
+
+        config = load_config(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", "base.yaml",
+            )
+        )
+        augmentor = build_augmentor(config, overrides={"backend": "api", "max_retries": 1})
+        assert augmentor.concurrency == int(config.get_path("llm.augmentation.batch_size", 4))
+
+    def test_explicit_concurrency_is_respected(self):
+        """显式覆盖必须生效——这正是回归测试要钉住的行为。"""
+        from src.llm.factory import build_augmentor
+        from src.utils.config import load_config
+
+        config = load_config(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", "base.yaml",
+            )
+        )
+        augmentor = build_augmentor(
+            config,
+            overrides={"backend": "transformers", "concurrency": 8, "max_retries": 1},
+        )
+        assert augmentor.concurrency == 8
+
+    def test_extra_body_empty_mapping_is_accepted(self):
+        """`extra_body: {}`（空流式映射）必须能被装配流程接受。"""
+        from src.llm.api_backend import APIBackend
+        from src.llm.factory import build_backend
+        from src.utils.config import load_config
+
+        config = load_config(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs", "base.yaml",
+            )
+        )
+        backend = build_backend(config, "api")
+        assert isinstance(backend, APIBackend)
+        assert backend.extra_body == {}
 
 
 # ===================================================================== #

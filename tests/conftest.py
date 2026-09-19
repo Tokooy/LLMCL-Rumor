@@ -36,13 +36,22 @@ def repo_root() -> str:
     return REPO_ROOT
 
 
-@pytest.fixture(scope="session")
-def demo_path(repo_root: str) -> str:
-    """仓库自带演示数据集的路径。"""
-    path = os.path.join(repo_root, "data", "samples", "demo_twitter15.jsonl")
+def demo_dataset_path() -> str:
+    """返回仓库自带演示数据的路径（普通函数，非 fixture）。
+
+    之所以同时提供函数与 fixture：fixture 版给用例用，函数版给其它 fixture
+    （例如 :func:`demo_file`）在内部调用——fixture 不能直接调用另一个 fixture。
+    """
+    path = os.path.join(REPO_ROOT, "data", "samples", "demo_twitter15.jsonl")
     if not os.path.isfile(path):
         pytest.skip(f"演示数据不存在：{path}")
     return path
+
+
+@pytest.fixture(scope="session")
+def demo_path() -> str:
+    """仓库自带演示数据集的路径。"""
+    return demo_dataset_path()
 
 
 @pytest.fixture()
@@ -55,10 +64,28 @@ def demo_records(demo_path: str) -> List[Dict[str, Any]]:
 
 @pytest.fixture()
 def demo_instances(demo_records: List[Dict[str, Any]]) -> List[Any]:
-    """演示数据集的 DataInstance 列表。"""
+    """演示数据集的 DataInstance 列表。
+
+    注意：每个用例拿到的是**新构造**的一份（这个 fixture 是 function 作用域），
+    用例可以放心就地修改（例如清空 ``text`` 后重新生成）。
+    """
     from data.processors.data_model import record_to_instance
 
     return [record_to_instance(record) for record in demo_records]
+
+
+@pytest.fixture()
+def demo_file(tmp_path) -> str:
+    """把演示数据复制到临时目录并返回路径。
+
+    用于那些会**写文件**的用例（例如读取后再落盘）：直接对仓库里的
+    ``demo_twitter15.jsonl`` 做原地读写会污染工作区，在只读沙箱下还会直接失败。
+    """
+    import shutil
+
+    target = tmp_path / "demo_twitter15.jsonl"
+    shutil.copyfile(demo_dataset_path(), target)
+    return str(target)
 
 
 @pytest.fixture()

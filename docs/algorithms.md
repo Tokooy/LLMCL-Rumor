@@ -111,10 +111,11 @@ end if
 
 | 论文步骤 | 代码位置 | 说明 |
 |---|---|---|
-| 第 3-4 行：动量更新 λ | `JointAlignmentTrainer.update_lambda` → `TiesMerger.update_lambda` | 式(8) `λ_m = β·f_m + (1-β)·λ_{m-1}`；`f_m` 为 CL 性能观测值 |
-| 第 5 行：由 λ 得权重 ω | `compute_omega` | 式(9)：`ω_m = clip(λ_m, ω_min, ω_max)` |
-| 第 6 行：微调 LLM | `JointAlignmentTrainer.finetune_and_merge` → `src.llm.lora.finetune_and_export` | 自举式微调：用 LLM 自己产出的增强数据构造训练对 |
-| 第 7 行：调用 Algorithm 1 合并 | `JointAlignmentTrainer.merge_and_apply` → `TiesMerger.merge` | 见上文 Algorithm 1 对照 |
+| 第 3-4 行：动量更新 λ | `JointAlignmentTrainer.update_lambda` → `TiesMerger.update_lambda` | 式(8) `λ_m = β·f_m + (1-β)·λ_{m-1}`；`f_m` 为 CL 性能观测值。**每个 epoch 调一次**（epoch 级 λ，用于监控） |
+| —（周期级快照） | `JointAlignmentTrainer.lambda_cycle` / `lambda_cycle_previous` / `omega_cycle` | 论文把式(8)(9) 放在**周期**块里，而实现每 epoch 都评测。为了让式(7) 的 α 插值仍是"本轮 vs 上一轮"，额外维护一对周期级快照：合并时用它，周期结束推进一格 |
+| 第 5 行：由 λ 得权重 ω | `compute_omega` | 式(9)：`ω_m = clip(λ_m, ω_min, ω_max)`；**合并时取 `omega_cycle`**，不使用 epoch 级 ω |
+| 第 6 行：微调 LLM | `JointAlignmentTrainer.finetune_and_merge` → `src.llm.lora.finetune_and_export` | 自举式微调：用 LLM 自己产出的增强数据构造训练对；每轮先 `reset_to_base()` 回到 θ_0，保证 τ 同基准 |
+| 第 7 行：调用 Algorithm 1 合并 | `JointAlignmentTrainer.merge_and_apply` → `TiesMerger.merge` | 见上文 Algorithm 1 对照；缩放系数用周期级 λ |
 | 第 8-9 行：数据增强 | `JointAlignmentTrainer.maybe_augment` → `Augmentor.augment` | 每 T 个 epoch 一次；结果落盘并累积进增强池 |
 | "数据增强及 CL 运行流程" | `JointAlignmentTrainer.on_epoch_end` 全流程 | 增强 → 重建训练集 → 继续 CL 训练 |
 | 第 10-15 行：m > M 停止 | `max_finetune_rounds` + `stop_when_max_reached` | 达到 M 后可选择停止训练 |

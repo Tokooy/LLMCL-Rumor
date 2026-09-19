@@ -1,0 +1,2 @@
+{"uid": "u1", "pred": "NR", "true": "NR", "pred_id": 0, "true_id": 0, "probabilities": [0.9, 0.05, 0.03, 0.02]}
+{"uid": "u2", "pred": "UR", "true": "TR", "pred_id": 3, "true_id": 2, "probabilities": [0.1, 0.2, 0.3, 0.4]}

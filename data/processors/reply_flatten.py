@@ -99,7 +99,18 @@ def flatten_replies(
 
     Returns:
         :class:`ReplySegment` 列表，``index`` 是展平后的序号，``depth`` 是嵌套深度。
+
+    Raises:
+        ValueError: ``order`` 不是 ``bfs`` / ``dfs``。
+
+    Note:
+        这里必须显式校验 ``order``：早期实现写成 ``if order == "bfs": ... else: dfs``，
+        于是任何拼错的取值（例如 ``"random"``、``"BFS"``）都会**静默按 DFS 处理**，
+        配置写错也不会报错，只会让回复顺序悄悄变化。
     """
+    if order not in ("bfs", "dfs"):
+        raise ValueError(f"reply_order 只支持 bfs/dfs，收到 {order!r}")
+
     segments: List[ReplySegment] = []
 
     if order == "bfs":
@@ -139,9 +150,10 @@ def _allocate_budget(
 ) -> Tuple[int, List[int]]:
     """给原帖与回复分配词数预算。
 
-    规则：
+    Rules:
     * 原帖上限 = ``min(source_words, ceil(sqrt(total) * 4))``，保证原帖不被回复挤掉；
-    * 若原帖比上限还长，则把全部预算给原帖；
+    * **若原帖比上限还长，则把全部预算给原帖**（返回 ``min(source_words, total_words)``），
+      回复不再纳入——这样长原帖不会被截到远低于可用预算的长度；
     * 剩余预算按顺序贪心分配，分完即止（后面的回复预算为 0，等于丢弃）。
     """
     if total_words <= 0:
@@ -150,6 +162,9 @@ def _allocate_budget(
     source_cap = max(1, int(math.ceil(math.sqrt(total_words) * 4)))
     source_budget = min(source_words, source_cap)
     if source_words > source_cap:
+        # 原帖本身超预算：把**全部预算**给它（而不是只给 source_cap），
+        # 否则会白白浪费掉 total_words - source_cap 个词的额度。
+        return min(source_words, total_words), [0] * len(reply_word_counts)
         # 原帖本身超预算：全部给它，回复不再纳入
         return source_cap, [0] * len(reply_word_counts)
 

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .base import GenerationResult, LLMBackend, TaskVectorLike
@@ -86,6 +87,9 @@ class HFBackend(LLMBackend):
         self._tokenizer = None
         self._peft_model = None
         self._base_lora_state: Optional[Dict[str, Any]] = None
+        # 加载模型必须串行：Augmentor 的线程池可能并发进入 generate()，
+        # 若无锁保护，多个线程会同时 from_pretrained 同一份 7B/13B 权重（显存爆炸）。
+        self._load_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # 加载
@@ -109,20 +113,31 @@ class HFBackend(LLMBackend):
         return mapping[self.torch_dtype_name]
 
     def _ensure_loaded(self) -> None:
-        """首次调用时加载模型与分词器。"""
+        """首次调用时加载模型与分词器（线程安全）。
+
+        双重检查：先在无锁路径快速返回（已加载是最常见的情况），
+        未加载时再进锁，进锁后重新判断一次，避免两个线程都执行加载。
+        """
         if self._model is not None:
             return
 
+        with self._load_lock:
+            if self._model is not None:
+                return
+            self._load_locked()
+
+    def _load_locked(self) -> None:
+        """真正的加载逻辑，必须持有 :attr:`_load_lock` 才能调用。"""
         import torch  # noqa: F401  （确保依赖存在，报错信息更清晰）
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self._tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
             trust_remote_code=self.trust_remote_code,
             padding_side="left",  # 因果 LM 批量生成必须左填充
         )
-        if self._tokenizer.pad_token is None:
-            self._tokenizer.pad_token = self._tokenizer.eos_token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
         load_kwargs: Dict[str, Any] = {
             "trust_remote_code": self.trust_remote_code,
@@ -135,8 +150,12 @@ class HFBackend(LLMBackend):
         else:
             load_kwargs["torch_dtype"] = self._resolve_dtype()
 
-        self._model = AutoModelForCausalLM.from_pretrained(self.model_path, **load_kwargs)
-        self._model.eval()
+        model = AutoModelForCausalLM.from_pretrained(self.model_path, **load_kwargs)
+        model.eval()
+
+        # 先本地变量构造完成，再一次性发布，避免其他线程看到"半初始化"状态
+        self._tokenizer = tokenizer
+        self._model = model
 
     # ------------------------------------------------------------------ #
     # 生成
@@ -174,9 +193,22 @@ class HFBackend(LLMBackend):
     ) -> List[GenerationResult]:
         """批量生成增强结果。
 
-        温度策略：若 ``temperature`` 为 ``None``，则对第 i 条样本使用
-        ``base_temperature + jitter * (i % 3 - 1)``，让同一批样本的改写风格有差异，
-        对应论文"多样性提升"目标。
+        **真正的批处理**：按温度把 Prompt 分成至多 3 组，每组一次
+        ``model.generate`` 调用，而不是逐条生成。这样 ``llm.augmentation.batch_size``
+        才有意义（否则它只能当线程数用，而本地后端又是串行的）。
+
+        温度与多样性的关系（论文"多样性提升"目标的落点）：
+
+        * ``temperature_jitter = 0``（默认即 0.05）时所有样本同温，
+          多样性完全来自采样本身；
+        * ``temperature_jitter > 0`` 时按 ``i % 3`` 把样本分到
+          ``base - jitter / base / base + jitter`` 三档，让同一批数据的改写风格有差异；
+        * **同一档内温度相同**，因此可以安全地合成一个 batch——
+          逐条生成与分批生成在同一档内是无差别的。
+
+        可复现性：每个 batch 生成前调用一次 ``torch.manual_seed(seed + group_index)``。
+        分组只取决于 Prompt 在输入序列中的下标，因此同一份输入在不同 batch_size 下
+        得到的结果完全一致。
         """
         if not prompts:
             return []
@@ -204,28 +236,30 @@ class HFBackend(LLMBackend):
         do_sample = bool(self.generation_config.get("do_sample", True))
         seed = self.generation_config.get("seed")
 
-        results: List[GenerationResult] = []
-        encoded, _ = self._build_inputs(prompts)
+        # 按温度分档：jitter=0 时只有一档（全部同温）
+        groups: Dict[int, List[int]] = {}
+        for index in range(len(prompts)):
+            group_index = (index % 3) if jitter else 0
+            groups.setdefault(group_index, []).append(index)
 
-        # 固定随机种子：让同一配置多次运行得到同样的增强结果，便于复现论文数值。
-        # 注意必须用 torch.manual_seed（全局 RNG），因为 transformers 的 generate()
-        # 不接受 generator 参数；逐条设置可以让"第 i 条样本"与批大小无关地可复现。
-        if seed is not None:
-            torch.manual_seed(int(seed))
+        results: List[Optional[GenerationResult]] = [None] * len(prompts)
 
         with torch.no_grad():
-            for index, spec in enumerate(prompts):
-                sample_temperature = max(0.01, base_temperature + jitter * ((index % 3) - 1))
-                if seed is not None:
-                    # 每条样本推进一次 RNG，保证样本级可复现（而不是整批一起变）
-                    torch.manual_seed(int(seed) + index)
+            for group_index in sorted(groups):
+                indices = groups[group_index]
+                sample_temperature = max(
+                    0.01, base_temperature + jitter * (group_index - 1)
+                ) if jitter else max(0.01, base_temperature)
 
-                single = {
-                    key: value[index : index + 1] for key, value in encoded.items()
-                }
+                # 只编码本组的 Prompt
+                group_specs = [prompts[index] for index in indices]
+                encoded, _ = self._build_inputs(group_specs)
+                if seed is not None:
+                    torch.manual_seed(int(seed) + group_index)
+
                 try:
                     output_ids = self._model.generate(
-                        **single,
+                        **encoded,
                         max_new_tokens=self.max_new_tokens,
                         do_sample=do_sample,
                         temperature=sample_temperature,
@@ -236,60 +270,82 @@ class HFBackend(LLMBackend):
                         eos_token_id=self._tokenizer.eos_token_id,
                         **kwargs,
                     )
-                    input_length = single["input_ids"].shape[1]
-                    completion = output_ids[0][input_length:]
-                    text = self._tokenizer.decode(completion, skip_special_tokens=True)
-                    results.append(
-                        GenerationResult(
+                    prompt_length = encoded["input_ids"].shape[1]
+                    for row, original_index in enumerate(indices):
+                        completion = output_ids[row][prompt_length:]
+                        text = self._tokenizer.decode(completion, skip_special_tokens=True)
+                        results[original_index] = GenerationResult(
                             text=text,
-                            uid=str(spec.meta.get("uid", "")),
-                            prompt_hash=spec.prompt_hash,
+                            uid=str(prompts[original_index].meta.get("uid", "")),
+                            prompt_hash=prompts[original_index].prompt_hash,
                             meta={
                                 "temperature": sample_temperature,
+                                "temperature_group": group_index,
                                 "backend": self.name,
                                 "model_name": self.model_name,
                             },
                         )
-                    )
                 except Exception as exc:
-                    results.append(
-                        GenerationResult(
-                            uid=str(spec.meta.get("uid", "")),
-                            prompt_hash=spec.prompt_hash,
-                            error=f"生成失败：{exc}",
+                    # 整组失败：逐条标记错误，但不中断其它组
+                    for original_index in indices:
+                        results[original_index] = GenerationResult(
+                            uid=str(prompts[original_index].meta.get("uid", "")),
+                            prompt_hash=prompts[original_index].prompt_hash,
+                            error=f"生成失败（温度档 {group_index}）：{exc}",
                         )
-                    )
-        return results
+
+        return [
+            result if result is not None
+            else GenerationResult(
+                uid=str(prompts[index].meta.get("uid", "")),
+                prompt_hash=prompts[index].prompt_hash,
+                error="生成结果缺失",
+            )
+            for index, result in enumerate(results)
+        ]
 
     # ------------------------------------------------------------------ #
     # LoRA 微调
     # ------------------------------------------------------------------ #
     def _ensure_peft(self):
-        """注入 LoRA 适配器（幂等），并记录初始化状态以计算任务向量。"""
+        """注入 LoRA 适配器（幂等且线程安全），并记录初始化状态以计算任务向量。
+
+        走 :meth:`_ensure_loaded` 的同一把锁：LoRA 注入会改模型结构，
+        并发进入会让两个线程各自包一层适配器。
+        """
         if self._peft_model is not None:
             return self._peft_model
 
-        self._ensure_loaded()
-        from peft import LoraConfig, get_peft_model
+        with self._load_lock:
+            if self._peft_model is not None:
+                return self._peft_model
 
-        config = self.lora_config or {}
-        target_modules = config.get("target_modules") or list(_QWEN_TARGET_MODULES)
-        lora_config = LoraConfig(
-            r=int(config.get("r", 8)),
-            lora_alpha=int(config.get("alpha", 16)),
-            lora_dropout=float(config.get("dropout", 0.05)),
-            bias=str(config.get("bias", "none")),
-            task_type="CAUSAL_LM",
-            target_modules=list(target_modules),
-        )
-        self._peft_model = get_peft_model(self._model, lora_config)
-        # 冻结状态快照：TIES-Merging 需要 θ_base（这里即 LoRA 的初始值）
-        self._base_lora_state = {
-            name: param.detach().clone()
-            for name, param in self._peft_model.named_parameters()
-            if param.requires_grad
-        }
-        return self._peft_model
+            # 注意：这里调用 _load_locked 而不是 _ensure_loaded——
+            # 后者会再次获取同一把非重入锁，直接死锁。
+            if self._model is None:
+                self._load_locked()
+            from peft import LoraConfig, get_peft_model
+
+            config = self.lora_config or {}
+            target_modules = config.get("target_modules") or list(_QWEN_TARGET_MODULES)
+            lora_config = LoraConfig(
+                r=int(config.get("r", 8)),
+                lora_alpha=int(config.get("alpha", 16)),
+                lora_dropout=float(config.get("dropout", 0.05)),
+                bias=str(config.get("bias", "none")),
+                task_type="CAUSAL_LM",
+                target_modules=list(target_modules),
+            )
+            peft_model = get_peft_model(self._model, lora_config)
+            # 冻结状态快照：TIES-Merging 需要 θ_base（这里即 LoRA 的初始值）
+            base_state = {
+                name: param.detach().clone()
+                for name, param in peft_model.named_parameters()
+                if param.requires_grad
+            }
+            self._peft_model = peft_model
+            self._base_lora_state = base_state
+            return self._peft_model
 
     def _lora_parameter_names(self) -> List[str]:
         model = self._ensure_peft()
