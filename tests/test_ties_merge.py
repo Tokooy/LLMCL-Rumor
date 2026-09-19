@@ -101,7 +101,7 @@ class TestLambdaAndOmega:
         assert merger.lambda_previous == pytest.approx(0.82)
 
     def test_omega_is_clipped_and_monotonic(self):
-        from src.llm.joint_trainer import compute_omega
+        from src.training.joint_trainer import compute_omega
 
         assert compute_omega(0.0, 0.05, 0.95) == pytest.approx(0.05)
         assert compute_omega(1.0, 0.05, 0.95) == pytest.approx(0.95)
@@ -111,7 +111,7 @@ class TestLambdaAndOmega:
         assert values == sorted(values)
 
     def test_omega_rejects_inverted_bounds(self):
-        from src.llm.joint_trainer import compute_omega
+        from src.training.joint_trainer import compute_omega
 
         with pytest.raises(ValueError, match="omega_min"):
             compute_omega(0.5, omega_min=0.9, omega_max=0.1)

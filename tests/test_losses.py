@@ -45,7 +45,17 @@ class TestSimilarity:
 # ===================================================================== #
 class TestPairedInfoNCE:
     def test_perfect_alignment_gives_low_loss(self):
-        """正样本完全对齐、负样本正交时，损失应显著低于随机情形。"""
+        """正样本完全对齐、负样本正交时，损失有闭式解。
+
+        设 τ 为温度、B 为 batch 大小。锚点与其正样本完全相同（余弦相似度 1），
+        与其它样本正交（相似度 0），则第 i 行的 InfoNCE 为::
+
+            -log( e^{1/τ} / ( e^{1/τ} + (B-1)·e^{0} ) )
+          = -log( 1 / ( 1 + (B-1)·e^{-1/τ} ) )
+          = log( 1 + (B-1)·e^{-1/τ} )
+
+        对称项与它完全一致，故最终损失就是这个值。
+        """
         from src.training.losses import paired_infonce_loss
 
         batch = 4
@@ -54,9 +64,10 @@ class TestPairedInfoNCE:
         anchor = torch.cat([base, torch.zeros(batch, 4)], dim=1)
         positive = anchor.clone()
         loss = paired_infonce_loss(anchor, positive, temperature=0.07)
-        # 正样本相似度 1、负样本 0 → loss = log(1 + (B-1)·exp(-1/τ))
         expected = math.log(1 + (batch - 1) * math.exp(-1 / 0.07))
         assert loss.item() == pytest.approx(expected, rel=1e-4)
+        # 顺带钉住量级：τ=0.07 时该值应远小于 1
+        assert loss.item() < 0.01
 
     def test_misaligned_positives_raise_loss(self):
         from src.training.losses import paired_infonce_loss
@@ -93,28 +104,31 @@ class TestPairedInfoNCE:
             paired_infonce_loss(torch.randn(2, 4), torch.randn(2, 4), temperature=0.0)
 
     def test_negative_mask_blocks_positions(self):
-        """被屏蔽的位置不参与 logsumexp：屏蔽掉"最难的负样本"后损失必须下降。"""
-        from src.training.losses import paired_infonce_loss
+        """被屏蔽的位置不参与 logsumexp：屏蔽掉一个负样本后损失必须下降。
+
+        构造：B=4，取第 0 行相似度最大的那个非对角位置（最难的负样本）并屏蔽它。
+        屏蔽后第 0 行的分母变小、正样本占比升高 → 该行损失下降；
+        其它行的 logits 完全不变 → 总损失严格下降。
+        """
+        from src.training.losses import cosine_similarity_matrix, paired_infonce_loss
 
         torch.manual_seed(0)
-        batch = 3
+        batch = 4
         anchor = torch.randn(batch, 8)
         positive = anchor + 0.1 * torch.randn(batch, 8)
 
-        full_mask = torch.ones(batch, batch, dtype=torch.bool)
-        # 找出最相似的"非对角"位置并屏蔽
-        from src.training.losses import cosine_similarity_matrix
-
+        # 找出第 0 行最相似的负样本列
         similarity = cosine_similarity_matrix(anchor)
-        similarity.fill_diagonal_(-float("inf"))
-        hardest = int(torch.argmax(similarity.reshape(-1)).item())
-        row, column = divmod(hardest, batch)
-        if row != column:
-            full_mask[row, column] = False
+        similarity[0, 0] = -float("inf")          # 排除正样本列
+        hardest_column = int(torch.argmax(similarity[0]).item())
 
-        with_hard = paired_infonce_loss(anchor, positive, 0.07, negative_mask=torch.ones_like(full_mask))
-        without_hard = paired_infonce_loss(anchor, positive, 0.07, negative_mask=full_mask)
-        assert without_hard.item() <= with_hard.item() + 1e-6
+        full_mask = torch.ones(batch, batch, dtype=torch.bool)
+        masked = full_mask.clone()
+        masked[0, hardest_column] = False
+
+        baseline = paired_infonce_loss(anchor, positive, 0.07, negative_mask=full_mask)
+        blocked = paired_infonce_loss(anchor, positive, 0.07, negative_mask=masked)
+        assert blocked.item() < baseline.item()
 
     def test_gradients_are_finite_with_masking(self):
         """屏蔽用 -inf 时曾出现过 NaN 梯度，这里做回归测试。"""
