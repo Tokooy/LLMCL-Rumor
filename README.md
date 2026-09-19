@@ -39,8 +39,14 @@ LLMCL-Rumor/
 ├── scripts/            【入口层】按流水线顺序排列的可执行脚本
 ├── tests/              【测试层】纯 CPU 单测，不需要模型权重（可在装完依赖后直接跑）
 ├── docs/               【文档层】结构说明、算法逐行对照、与原项目的差异说明
+├── reference/          【参考层】原开源项目快照（只读，不参与运行）
 └── outputs/            【产物层】checkpoints / logs / results / figures（不入库）
 ```
+
+> **目录整理说明**：原开源项目 `Bert-TextClassification-master` 已完整移入
+> `reference/baseline/`，并补上 `reference/README.md` 说明每个文件对应新项目的哪个位置。
+> 这样仓库根目录只剩下"标准深度学习项目"该有的目录，
+> 参考代码被明确隔离在 `reference/` 下，不会再与主流程混淆。
 
 ### 2.1 `configs/` —— 配置
 
@@ -112,6 +118,16 @@ LLMCL-Rumor/
 | `train_cl.py` | 单轮次对比学习训练（对应 Proposed-1/2/3，M=0） |
 | `joint_align.py` | 完整对齐流程（对应 Proposed-4/5/6，M>0） |
 | `evaluate.py` | 加载 checkpoint 评测并导出指标 / t-SNE 图 |
+
+### 2.7 `reference/` —— 原开源项目快照
+
+| 路径 | 用途 |
+|---|---|
+| `reference/baseline/` | `Bert-TextClassification-master` 原样快照（只读参考，**不参与运行**） |
+| `reference/README.md` | 原项目每个文件对应新项目的哪个位置、为什么不能直接运行 |
+
+保留它的三个理由：可追溯改造范围、可做骨干消融、可对照 `pytorch_pretrained_bert` 版本。
+主流程**不引用**该目录下的任何文件。
 
 ---
 
