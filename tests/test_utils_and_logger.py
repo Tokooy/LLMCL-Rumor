@@ -21,12 +21,31 @@ import pytest
 # 日志
 # ===================================================================== #
 class TestLoggerSetup:
-    """``src.utils.logger`` 的行为。"""
+    """``src.utils.logger`` 的行为。
+
+    注意：这些用例会真的创建日志文件，因此测试结束后必须**关闭 FileHandler**。
+    否则在 Windows 上文件仍被占用，``tmp_path`` 清理（以及实跑器的
+    ``shutil.rmtree``）会失败并留下残留目录——这正是
+    ``scripts/run_pure_python_tests.py`` 跑完后留下 ``.tmp_pure_tests/`` 的原因。
+    """
 
     @staticmethod
     def _fresh_logger_name(suffix: str) -> str:
         """用一个从未配置过的名字，避免与其他测试共享 _CONFIGURED 状态。"""
         return f"llmcl_test_{suffix}_{os.getpid()}"
+
+    @staticmethod
+    def _close_file_handlers(logger: logging.Logger) -> None:
+        """刷盘并关闭该 logger 上所有 FileHandler，并把它从 handler 列表移除。"""
+        from src.utils.logger import _CONFIGURED  # noqa: PLC0415 - 测试需要精确控制
+
+        for handler in list(logger.handlers):
+            if isinstance(handler, logging.FileHandler):
+                handler.flush()
+                handler.close()
+                logger.removeHandler(handler)
+        # 允许同名的 logger 在后续用例里被重新配置
+        _CONFIGURED.discard(logger.name)
 
     def test_file_created_on_first_call(self, tmp_path):
         """**首次**调用就必须生成日志文件。"""
@@ -34,13 +53,15 @@ class TestLoggerSetup:
 
         log_file = tmp_path / "run.log"
         logger = get_logger(self._fresh_logger_name("first"), log_file=str(log_file))
-        logger.info("hello from the first call")
-
-        for handler in logger.handlers:
-            handler.flush()
-        assert log_file.is_file(), "首次调用未创建日志文件"
-        content = log_file.read_text(encoding="utf-8")
-        assert "hello from the first call" in content
+        try:
+            logger.info("hello from the first call")
+            for handler in logger.handlers:
+                handler.flush()
+            assert log_file.is_file(), "首次调用未创建日志文件"
+            content = log_file.read_text(encoding="utf-8")
+            assert "hello from the first call" in content
+        finally:
+            self._close_file_handlers(logger)
 
     def test_console_handler_attached_once(self, tmp_path):
         """重复获取同一个 logger 不应重复挂 handler（否则日志会打印多份）。"""
@@ -49,14 +70,19 @@ class TestLoggerSetup:
         name = self._fresh_logger_name("once")
         log_file = tmp_path / "once.log"
         logger = get_logger(name, log_file=str(log_file))
-        console_before = [
-            handler for handler in logger.handlers if not isinstance(handler, logging.FileHandler)
-        ]
-        get_logger(name, log_file=str(log_file))
-        console_after = [
-            handler for handler in logger.handlers if not isinstance(handler, logging.FileHandler)
-        ]
-        assert len(console_before) == len(console_after) == 1
+        try:
+            console_before = [
+                handler for handler in logger.handlers
+                if not isinstance(handler, logging.FileHandler)
+            ]
+            get_logger(name, log_file=str(log_file))
+            console_after = [
+                handler for handler in logger.handlers
+                if not isinstance(handler, logging.FileHandler)
+            ]
+            assert len(console_before) == len(console_after) == 1
+        finally:
+            self._close_file_handlers(logger)
 
     def test_file_handler_not_duplicated(self, tmp_path):
         """同一路径的日志文件只应有一个 handler，重复调用不会写两遍。"""
@@ -65,18 +91,22 @@ class TestLoggerSetup:
         name = self._fresh_logger_name("dup")
         log_file = tmp_path / "dup.log"
         logger = get_logger(name, log_file=str(log_file))
-        get_logger(name, log_file=str(log_file))
-        get_logger(name, log_file=str(log_file))
+        try:
+            get_logger(name, log_file=str(log_file))
+            get_logger(name, log_file=str(log_file))
 
-        file_handlers = [
-            handler for handler in logger.handlers if isinstance(handler, logging.FileHandler)
-        ]
-        assert len(file_handlers) == 1
+            file_handlers = [
+                handler for handler in logger.handlers
+                if isinstance(handler, logging.FileHandler)
+            ]
+            assert len(file_handlers) == 1
 
-        logger.info("written once")
-        for handler in file_handlers:
-            handler.flush()
-        assert log_file.read_text(encoding="utf-8").count("written once") == 1
+            logger.info("written once")
+            for handler in file_handlers:
+                handler.flush()
+            assert log_file.read_text(encoding="utf-8").count("written once") == 1
+        finally:
+            self._close_file_handlers(logger)
 
     def test_no_log_file_configured_is_fine(self):
         """不传 log_file 时不应报错，也不应创建文件。"""
@@ -93,10 +123,13 @@ class TestLoggerSetup:
 
         log_file = tmp_path / "a" / "b" / "c" / "deep.log"
         logger = get_logger(self._fresh_logger_name("deep"), log_file=str(log_file))
-        logger.info("nested")
-        for handler in logger.handlers:
-            handler.flush()
-        assert log_file.is_file()
+        try:
+            logger.info("nested")
+            for handler in logger.handlers:
+                handler.flush()
+            assert log_file.is_file()
+        finally:
+            self._close_file_handlers(logger)
 
 
 # ===================================================================== #

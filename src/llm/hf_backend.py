@@ -206,9 +206,17 @@ class HFBackend(LLMBackend):
         * **同一档内温度相同**，因此可以安全地合成一个 batch——
           逐条生成与分批生成在同一档内是无差别的。
 
-        可复现性：每个 batch 生成前调用一次 ``torch.manual_seed(seed + group_index)``。
-        分组只取决于 Prompt 在输入序列中的下标，因此同一份输入在不同 batch_size 下
-        得到的结果完全一致。
+        可复现性：每个 batch 生成前调用一次 ``torch.manual_seed(seed + group_index)``，
+        同一份输入以**相同的 batch_size 与相同的顺序**重复运行会得到完全一致的结果。
+
+        Note:
+            温度分档是按"在本次调用内部的下标"决定的（``index % 3``），
+            因此改变 ``llm.augmentation.batch_size``（它决定 Augmentor 每次
+            提交多少条 Prompt）会改变某条样本落在哪一档、以及它所在组的随机种子，
+            生成结果随之变化。这与"逐条生成"的旧行为不同：
+            旧实现每条样本单独调用，下标恒为 0，所有样本都落在同一档
+            （实际上是 ``base - jitter``），既没有分档多样性，也无法批处理。
+            **要复现同一批增强结果，请固定 batch_size、seed 与输入顺序。**
         """
         if not prompts:
             return []

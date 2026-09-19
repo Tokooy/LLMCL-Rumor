@@ -320,7 +320,8 @@ def check_augmentation(checker: Checker) -> None:
         backend=DemoBackend(),
         prompt_builder=builder,
         cache_dir=None,
-        strict_format=False,   # 伪增强不满足多样性约束，这里只验证结构
+        strict_format=False,      # 伪增强不满足多样性约束，这里只验证结构
+        require_diversity=False,  # demo 后端是机械替换，词级重合度必然偏高
         concurrency=1,
     )
     augmented, stats = augmentor.augment(instances, augment_round=1)
@@ -365,6 +366,49 @@ def check_augmentation(checker: Checker) -> None:
             expect("word_overlap" in item.quality, "quality 缺少 word_overlap")
 
     checker.check("质量报告已生成", _quality_report)
+
+    def _diversity_gate() -> None:
+        """多样性门槛必须能拦住"原样回显输入"的假增强。
+
+        回显结果的结构、长度比例、语义全都合格，只有词级重合度会暴露它没做事；
+        因此门槛开启时应判失败、关闭时才接受。这条检查保证该门槛真的接线了。
+        """
+        import json as _json
+
+        from src.llm.base import GenerationResult
+
+        class EchoBackend:
+            name = "echo"
+            model_name = "echo"
+            supports_finetuning = False
+            supports_task_vector = False
+
+            def generate(self, prompts, temperature=None, **kwargs):
+                out = []
+                for spec in prompts:
+                    inst = _json.loads(
+                        spec.user.split("<instance>")[1].split("</instance>")[0]
+                    )
+                    out.append(
+                        GenerationResult(
+                            text=_json.dumps(inst, ensure_ascii=False),
+                            uid=str(spec.meta.get("uid", "")),
+                            prompt_hash=spec.prompt_hash,
+                        )
+                    )
+                return out
+
+        strict = Augmentor(
+            backend=EchoBackend(), prompt_builder=builder, cache_dir=None,
+            max_retries=1, strict_format=True, require_diversity=True,
+        )
+        _aug, strict_stats = strict.augment(instances[:2], augment_round=1)
+        expect(
+            strict_stats.succeeded == 0 and strict_stats.failed == 2,
+            f"回显结果应被多样性门槛拦下，实际 成功={strict_stats.succeeded}",
+        )
+
+    checker.check("多样性门槛拦住'原样回显'的假增强", _diversity_gate)
 
 
 # ---------------------------------------------------------------------- #
