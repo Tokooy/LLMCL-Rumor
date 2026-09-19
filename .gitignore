@@ -31,14 +31,17 @@ outputs/
 runs/
 wandb/
 
-# ---- LLM 权重与增强缓存 ----
-models/
-checkpoints/
+# ---- LLM 权重缓存 ----
+# 注意：这里必须用前导斜杠锚定到仓库根目录！
+# 写成 `models/` 会匹配任意层级的同名目录，把 src/models/（模型层源码）
+# 一起忽略掉，而 git status 不会给出任何提示——这是最危险的一类 gitignore 陷阱。
+/models/
+/checkpoints/
 *.gguf
 
 # ---- 日志与临时文件 ----
 *.log
-logs/
+/logs/
 tmp/
 temp/
 *.tmp
