@@ -53,8 +53,10 @@ SOURCE_SUFFIXES = (
     ".jsonl",
 )
 
-#: 允许被忽略的目录/文件（数据与产物，属于预期行为）
-ALLOWED_IGNORED_DIRS = ("data/raw/", "data/processed/", "outputs/")
+#: 允许被忽略的目录/文件（数据、产物与测试临时目录，属于预期行为）
+ALLOWED_IGNORED_DIRS = ("data/raw/", "data/processed/", "outputs/", "logs/")
+#: 允许被忽略的路径模式（测试/自检脚本的临时目录，见 .gitignore 的说明）
+ALLOWED_IGNORED_PATTERNS = (".tmp",)
 
 
 def _run_git(args: List[str]) -> Tuple[int, str]:
@@ -77,7 +79,17 @@ def _is_source_like(path: str) -> bool:
     lowered = path.lower()
     if not lowered.endswith(SOURCE_SUFFIXES):
         return False
-    return not any(lowered.startswith(prefix) for prefix in ALLOWED_IGNORED_DIRS)
+    if any(lowered.startswith(prefix) for prefix in ALLOWED_IGNORED_DIRS):
+        return False
+    # 测试/自检脚本的临时目录（.tmp*/ 与任意层级的 .tmp*/）
+    components = lowered.split("/")
+    if any(
+        part.startswith(pattern)
+        for part in components
+        for pattern in ALLOWED_IGNORED_PATTERNS
+    ):
+        return False
+    return True
 
 
 def ignored_source_files() -> List[str]:
