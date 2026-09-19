@@ -13,7 +13,11 @@
 3. 同一模块内重复定义的顶层函数/类名；
 4. **跨模块导入交叉检查**：``from src.x.y import name`` 里的模块文件是否存在、
    ``name`` 是否真的在目标模块里定义（这类错误会让测试在收集阶段就 ImportError，
-   而本机没装 torch 时根本跑不到那一步）。
+   而本机没装 torch 时根本跑不到那一步）；
+5. **跨模块调用签名检查**：调用 ``f(a, b, keyword=c)`` 时，``keyword`` 是否是
+   目标函数接受的参数、必需参数是否漏传。这类缺陷**不会抛任何异常**——
+   例如"某函数新增了一个能改变语义的可选参数，但调用点没传"，
+   语法检查、类型检查、甚至跑一遍都可能看不出来，因此需要工具兜底。
 
 用法::
 
@@ -30,7 +34,7 @@ import ast
 import builtins
 import os
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_TARGETS = ["src", "scripts", "tests", "data"]
@@ -164,6 +168,219 @@ def _module_public_names(path: str) -> Set[str]:
     return names
 
 
+def _collect_signatures(path: str, module_name: str) -> Dict[str, ast.arguments]:
+    """收集一个模块里所有可调用对象的参数表，键形如 ``func`` / ``Class.method``。
+
+    只做浅层解析（模块级函数 + 类内方法），这已经覆盖了本项目里绝大多数
+    "跨文件调用"的场景。
+    """
+    signatures: Dict[str, ast.arguments] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), path)
+    except (OSError, SyntaxError):
+        return signatures
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            signatures[node.name] = node.args
+        elif isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    signatures[f"{node.name}.{item.name}"] = item.args
+    return signatures
+
+
+def _iter_star_args(arguments: ast.arguments) -> Any:
+    return arguments.vararg, arguments.kwarg
+
+
+def _signature_problems(
+    arguments: ast.arguments,
+    call: ast.Call,
+    display_name: str,
+    is_method: bool = False,
+) -> List[str]:
+    """对比一次调用与目标函数签名，返回参数层面的问题描述。
+
+    Args:
+        arguments: 目标函数的参数表。
+        call: 调用节点。
+        display_name: 用于报错展示的名字。
+        is_method: 目标是否是类方法（``Class.method`` 形式）。为 True 时
+            需要跳过隐式绑定的第一个参数（``self`` / ``cls``），
+            否则 ``Reply.from_record(record)`` 会被误报成"缺少参数"。
+    """
+    problems: List[str] = []
+
+    positional = list(arguments.posonlyargs) + list(arguments.args)
+    if is_method and positional:
+        # 实例方法/类方法的第一个位置参数由绑定隐式提供
+        positional = positional[1:]
+    all_params = {arg.arg for arg in positional}
+    all_params |= {arg.arg for arg in arguments.kwonlyargs}
+    vararg, kwarg = _iter_star_args(arguments)
+    accepts_kwargs = kwarg is not None
+    accepts_varargs = vararg is not None
+    required_positional = len(positional)
+
+    # 1) 关键字参数名是否存在
+    seen_keywords: Dict[str, ast.keyword] = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:      # **kwargs 展开，无法静态判断
+            accepts_kwargs = True
+            continue
+        seen_keywords[keyword.arg] = keyword
+        if keyword.arg not in all_params and not accepts_kwargs:
+            problems.append(
+                f"{display_name} 不接受关键字参数 {keyword.arg!r}"
+                f"（可选：{sorted(all_params)}）"
+            )
+
+    # 2) 缺少必需参数（按位置与关键字一起算）
+    if not accepts_varargs and not accepts_kwargs:
+        supplied = len(call.args)
+        for index, arg in enumerate(positional):
+            has_default = index >= len(positional) - len(arguments.defaults)
+            if has_default or index < supplied or arg.arg in seen_keywords:
+                continue
+            problems.append(f"{display_name} 缺少必需参数 {arg.arg!r}")
+        for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
+            if default is None and arg.arg not in seen_keywords:
+                problems.append(f"{display_name} 缺少必需的关键字参数 {arg.arg!r}")
+
+    # 3) 位置参数给多了
+    if not accepts_varargs and len(call.args) > required_positional:
+        problems.append(
+            f"{display_name} 最多接受 {required_positional} 个位置参数，"
+            f"但传入了 {len(call.args)} 个"
+        )
+
+    return problems
+
+
+class SignatureIndex:
+    """跨模块调用签名索引：``模块名 -> {符号名: 参数表}``。
+
+    用于检查"调用点是否漏传/错传参数"——这类错误（例如漏传一个能改变语义的
+    关键字参数）**不会**引发任何运行时异常，静态语法检查也看不到，
+    正是最需要工具兜底的一类缺陷。
+    """
+
+    def __init__(self) -> None:
+        self.modules: Dict[str, Dict[str, ast.arguments]] = {}
+        self.imports: Dict[str, Dict[str, str]] = {}
+
+    def build(self, files: Sequence[str]) -> None:
+        """建索引。
+
+        **索引范围始终覆盖整个仓库**（``src/ data/ scripts/ tests/``），
+        与"这次要检查哪些目标"无关：否则只检查某个子目录时，
+        被调用方不在索引里，跨模块调用就会静默跳过检查（漏报）。
+        """
+        scanned: List[str] = []
+        for target in DEFAULT_TARGETS:
+            scanned.extend(iter_python_files([target]))
+        scanned.extend(files)
+        for path in sorted(set(scanned)):
+            if not path.endswith(".py"):
+                continue
+            relative = os.path.relpath(path, REPO_ROOT).replace("\\", "/")
+            if relative.startswith("reference/") or relative.startswith(".tmp"):
+                continue
+            module_name = relative[:-3].replace("/", ".")
+            self.modules[module_name] = _collect_signatures(path, module_name)
+
+            # 记录该模块里 from ... import ... 的别名（用于解析 Class.method）
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    tree = ast.parse(handle.read(), path)
+            except (OSError, SyntaxError):
+                continue
+            mapping: Dict[str, str] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    for alias in node.names:
+                        mapping[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+            self.imports[module_name] = mapping
+
+    def resolve(self, current_module: str, dotted: str) -> Optional[ast.arguments]:
+        """把一次调用的名字解析成目标函数的参数表；无法确定时返回 None。"""
+        parts = dotted.split(".")
+        # 情况一：本模块内的函数/方法
+        for cut in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:cut])
+            if candidate in self.modules.get(current_module, {}):
+                return self.modules[current_module][candidate]
+
+        # 情况二：module.attr.method / module.func
+        for cut in range(len(parts) - 1, 0, -1):
+            module_name = ".".join(parts[:cut])
+            if module_name in self.modules:
+                rest = ".".join(parts[cut:])
+                signature = self.modules[module_name].get(rest)
+                if signature is not None:
+                    return signature
+
+        # 情况三：from x import Y 后的 Y.method
+        if len(parts) >= 2 and parts[0] in self.imports.get(current_module, {}):
+            target = self.imports[current_module][parts[0]]
+            module_name, _, attr = target.rpartition(".")
+            rest = ".".join([attr] + parts[1:])
+            if module_name in self.modules:
+                signature = self.modules[module_name].get(rest)
+                if signature is not None:
+                    return signature
+        return None
+
+
+def check_call_signatures(
+    path: str,
+    source: str,
+    index: SignatureIndex,
+) -> List[str]:
+    """检查跨模块调用的参数是否与目标函数签名一致。"""
+    problems: List[str] = []
+    try:
+        tree = ast.parse(source, path)
+    except SyntaxError:
+        return problems
+
+    relative = os.path.relpath(path, REPO_ROOT).replace("\\", "/")
+    current_module = relative[:-3].replace("/", ".") if relative.endswith(".py") else relative
+
+    class CallVisitor(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            name = self._dotted_name(node.func)
+            if name:
+                signature = index.resolve(current_module, name)
+                if signature is not None:
+                    # 形如 A.b(...) 的目标是类方法/实例方法，跳过隐式首参
+                    is_method = "." in name
+                    for problem in _signature_problems(
+                        signature, node, name, is_method=is_method
+                    ):
+                        problems.append(f"{path}:{node.lineno}: {problem}")
+            self.generic_visit(node)
+
+        @staticmethod
+        def _dotted_name(node: ast.AST) -> Optional[str]:
+            """把 ``a.b.c`` 形式的调用目标还原成字符串；其它形式返回 None。"""
+            parts: List[str] = []
+            current = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            else:
+                return None
+            return ".".join(reversed(parts))
+
+    CallVisitor().visit(tree)
+    return problems
+
+
 def check_cross_module_imports(path: str, source: str) -> List[str]:
     """检查 ``from src./data. import ...`` 的模块与名字是否真实存在。
 
@@ -211,7 +428,7 @@ def check_cross_module_imports(path: str, source: str) -> List[str]:
     return problems
 
 
-def check_module(path: str) -> List[str]:
+def check_module(path: str, index: Optional["SignatureIndex"] = None) -> List[str]:
     """返回该模块的所有静态提示。"""
     problems: List[str] = []
     try:
@@ -304,6 +521,10 @@ def check_module(path: str) -> List[str]:
     # ---- 4) 跨模块导入交叉检查 ----
     problems.extend(check_cross_module_imports(path, source))
 
+    # ---- 5) 跨模块调用签名检查（漏传/错传参数）----
+    if index is not None:
+        problems.extend(check_call_signatures(path, source, index))
+
     return problems
 
 
@@ -311,12 +532,21 @@ def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AST 静态一致性自检（不运行代码）")
     parser.add_argument("targets", nargs="*", default=DEFAULT_TARGETS)
     parser.add_argument("--strict", action="store_true", help="有提示即返回非 0")
+    parser.add_argument("--no-signature-check", action="store_true",
+                        help="关闭跨模块调用签名检查")
     args = parser.parse_args(argv)
 
     files = iter_python_files(args.targets or DEFAULT_TARGETS)
+
+    # 先建全局签名索引，再做逐文件检查（签名检查需要看到全部模块）
+    index: Optional[SignatureIndex] = None
+    if not args.no_signature_check:
+        index = SignatureIndex()
+        index.build(files)
+
     total = 0
     for path in files:
-        problems = check_module(path)
+        problems = check_module(path, index)
         rel = os.path.relpath(path, REPO_ROOT)
         if problems:
             total += len(problems)
