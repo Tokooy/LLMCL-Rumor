@@ -251,12 +251,27 @@ class TestLambdaAndOmegaWiring:
         assert trainer.state.lambda_current == pytest.approx(0.6)
         assert trainer.state.omega == pytest.approx(0.6)
 
-    def test_omega_clipped_at_bounds(self):
-        trainer = build_trainer(omega_min=0.05, omega_max=0.95)
+    def test_omega_hits_bounds_when_lambda_does(self):
+        """λ 到达上下界时 ω 必须被截断到 [omega_min, omega_max]。
+
+        注意：式(8) 是动量更新，默认 β=0.9 时 λ 一次更新到不了端点
+        （f=0 → λ=0.1，f=1 → λ=0.91）。要检验截断行为，必须让 λ 真正落到界外，
+        因此这里把 β 设为 1.0（等价于直接用 f 当 λ）。
+        """
+        trainer = build_trainer(momentum_beta=1.0, lambda_init=0.5, omega_min=0.05, omega_max=0.95)
         trainer.update_lambda(0.0)
+        assert trainer.state.lambda_current == pytest.approx(0.0)
         assert trainer.state.omega == pytest.approx(0.05)
         trainer.update_lambda(1.0)
+        assert trainer.state.lambda_current == pytest.approx(1.0)
         assert trainer.state.omega == pytest.approx(0.95)
+
+    def test_omega_with_default_beta_stays_inside_bounds(self):
+        """默认 β 下 λ 达不到端点，ω 也不应越界。"""
+        trainer = build_trainer(momentum_beta=0.9, lambda_init=1.0, omega_min=0.05, omega_max=0.95)
+        trainer.update_lambda(0.0)          # λ = 0.1
+        assert trainer.state.omega == pytest.approx(0.1)
+        assert 0.05 <= trainer.state.omega <= 0.95
 
     def test_multiple_updates_chain(self):
         trainer = build_trainer(momentum_beta=0.9, lambda_init=1.0)
