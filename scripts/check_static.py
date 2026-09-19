@@ -35,7 +35,19 @@ from typing import Dict, List, Optional, Set, Tuple
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_TARGETS = ["src", "scripts", "tests", "data"]
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "build", "dist", "node_modules"}
-IMPLICIT_LOCALS = {"self", "cls", "__class__"}
+IMPLICIT_LOCALS = {
+    "self",
+    "cls",
+    "__class__",
+    # 模块级 dunder：由导入系统注入，AST 上看不到赋值语句
+    "__file__",
+    "__name__",
+    "__doc__",
+    "__package__",
+    "__spec__",
+    "__loader__",
+    "__builtins__",
+}
 #: 参与跨模块导入检查的包前缀
 CHECKED_PACKAGES = ("src", "data")
 

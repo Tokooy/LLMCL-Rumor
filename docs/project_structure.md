@@ -101,7 +101,9 @@ proposed-4.yaml  →  llm/qwen7b.yaml  →  base.yaml
 | `classifier.py` | §3.2 式(4) 的分类器 |
 | `cl_model.py` | Fig.1 的 "CL classification network" 总装 |
 | `tokenization.py` | BERT 分词（数据集契约） |
-| `backbones/` | 原项目的其它骨干，**论文未使用**，仅供消融 |
+
+论文未使用原项目里的其它骨干，因此本目录没有 `backbones/`；
+那些骨干的完整代码在 `reference/baseline/`（只读快照）。
 
 ---
 

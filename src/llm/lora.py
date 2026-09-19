@@ -197,25 +197,31 @@ def finetune_and_export(
     backend: Any,
     records: Sequence[Mapping[str, Any]],
     output_dir: str,
-    base_vector: Optional[Mapping[str, Any]] = None,
+    reset_to_base: bool = True,
     logger: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """执行一次微调并导出任务向量。
 
-    ``base_vector`` 用于"累计差分"：TIES-Merging 要求每个任务向量都相对**同一基座**
-    ``θ_0``。若后端每次微调前不会重置参数，就必须减去上一次的累计结果，
-    否则任务向量会被重复累加。
+    **每个周期的任务向量都必须相对同一个基座 θ_0**（TIES-Merging 的前提），
+    而上一轮结束时已经把合并结果 ``θ_0 + scaling·τ_merged`` 写回了 LoRA 参数。
+    因此本函数默认先调用 ``backend.reset_to_base()`` 把参数恢复到 θ_0，
+    再从 θ_0 出发微调——这样导出的 ``τ`` 恰好是"本轮自己的微调增量 + 相对 θ_0"。
+
+    另一种做法是"减去上一次导出的原始 τ 之和"，但那是错的：被写回模型的是
+    **合并并缩放后**的 ``scaling·τ_merged``，不等于原始 τ 之和；从第 3 轮起
+    导出的向量既不是本轮增量、也不是相对 θ_0 的增量，Algorithm 1 的输入就被污染了。
 
     Args:
         backend: 支持微调的后端。
         records: 微调样本（来自 :func:`build_finetune_records`）。
         output_dir: LoRA 适配器保存目录。
-        base_vector: 上一次导出的任务向量；非空时本次导出结果会减去它。
+        reset_to_base: 是否在微调前把参数重置回 θ_0（默认 True，建议保持）。
+            置为 False 只适用于"后端自己保证每轮从 θ_0 出发"的场景。
         logger: 可选 logger。
 
     Returns:
-        ``{"path", "vector", "stats", "num_records"}``；后端不支持微调时
-        ``vector`` 为 ``None``。
+        ``{"path", "vector", "stats", "num_records", "reset_to_base"}``；
+        后端不支持微调时 ``vector`` 为 ``None``。
     """
     def _log(message: str, level: str = "info") -> None:
         if logger is not None:
@@ -227,30 +233,47 @@ def finetune_and_export(
             "（论文 Proposed-1/2/3 的 M=0 设置不受影响）",
             level="warning",
         )
-        return {"path": None, "vector": None, "stats": {}, "num_records": 0}
+        return {"path": None, "vector": None, "stats": {}, "num_records": 0,
+                "reset_to_base": False}
 
     if not records:
         _log("没有可用的自举微调样本（增强数据为空），跳过本轮微调", level="warning")
-        return {"path": None, "vector": None, "stats": {}, "num_records": 0}
+        return {"path": None, "vector": None, "stats": {}, "num_records": 0,
+                "reset_to_base": False}
+
+    did_reset = False
+    if reset_to_base:
+        try:
+            backend.reset_to_base()
+            did_reset = True
+            _log("已把 LoRA 参数重置回基座 θ_0，保证本轮 τ 与其他轮次同基准")
+        except NotImplementedError:
+            _log(
+                f"{backend.name} 后端未实现 reset_to_base()，"
+                "本轮任务向量可能不与 θ_0 同基准，请检查合并结果",
+                level="warning",
+            )
 
     adapter_dir = backend.finetune(records, output_dir)
     _log(f"LoRA 微调完成：{len(records)} 条自举样本，适配器保存于 {adapter_dir}")
 
     vector = export_task_vector(backend)
     if vector is None:
-        return {"path": adapter_dir, "vector": None, "stats": {}, "num_records": len(records)}
-
-    if base_vector:
-        # 累计差分：确保所有任务向量都相对同一个 θ_0
-        vector = subtract_parameters(vector, base_vector)
-        _log("已扣除上一次的累计任务向量，保证所有 τ 都相对同一基座 θ_0")
+        return {"path": adapter_dir, "vector": None, "stats": {},
+                "num_records": len(records), "reset_to_base": did_reset}
 
     stats = describe_task_vector(vector)
     _log(
         f"任务向量：{stats['num_parameters']} 个参数、{stats['total_entries']} 项、"
         f"稀疏度 {stats['sparsity']:.4f}"
     )
-    return {"path": adapter_dir, "vector": vector, "stats": stats, "num_records": len(records)}
+    return {
+        "path": adapter_dir,
+        "vector": vector,
+        "stats": stats,
+        "num_records": len(records),
+        "reset_to_base": did_reset,
+    }
 
 
 def register_task_vector(

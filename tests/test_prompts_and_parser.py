@@ -119,6 +119,67 @@ class TestResponseParsing:
         )
         assert parse_augmentation_response(text)["string_value"] == "hi"
 
+    def test_qwen_style_think_block_is_stripped(self):
+        """Qwen 的推理块闭合标签是 ``</think>``（不是 ``</think>``），必须能剥掉。
+
+        回归测试：原实现的正则是 ``<{tag}>.*?</{tag}>``，对 Qwen 完全失效，
+        只能靠括号扫描兜底——而思考过程里经常出现示例 JSON，
+        扫描可能抽出**思考文本里的**那个对象。这里刻意在思考块里放一个诱饵 JSON。
+        """
+        from src.llm.parser import parse_augmentation_response
+
+        text = (
+            "Thinking Process:\n"
+            "1. The user wants a rewrite.\n"
+            "Example of the required shape: "
+            '{"uid": "DECOY", "string_value": "I am a decoy", "replies": []}\n'
+            "Now produce the answer.\n"
+            "<｜end▁of▁thinking｜>"
+            '{"uid": "u1", "string_value": "the real rewrite", "replies": []}'
+        )
+        payload = parse_augmentation_response(text)
+        assert payload["uid"] == "u1", "抽到了思考块里的诱饵 JSON"
+        assert payload["string_value"] == "the real rewrite"
+
+    def test_think_block_with_standard_closing_tag_is_stripped(self):
+        """DeepSeek 风格的 ``<｜end▁of▁thinking｜>`` 同样要能剥掉。"""
+        from src.llm.parser import parse_augmentation_response
+
+        text = (
+            "reasoning here with a decoy "
+            '{"uid": "DECOY", "string_value": "nope", "replies": []}'
+            "<｜end▁of▁thinking｜>"
+            '{"uid": "u2", "string_value": "kept", "replies": []}'
+        )
+        payload = parse_augmentation_response(text)
+        assert payload["uid"] == "u2"
+        assert payload["string_value"] == "kept"
+
+    def test_harmony_style_analysis_block_is_stripped(self):
+        """Harmony 风格 ``<|channel|>analysis<|message|>…<|end|>`` 也要能剥掉。"""
+        from src.llm.parser import parse_augmentation_response
+
+        text = (
+            "<|channel|>analysis<|message|>let me think "
+            '{"uid": "DECOY", "string_value": "nope", "replies": []}'
+            "<|end|>"
+            '{"uid": "u3", "string_value": "final", "replies": []}'
+        )
+        payload = parse_augmentation_response(text)
+        assert payload["uid"] == "u3"
+
+    def test_markdown_fence_and_reasoning_combined(self):
+        from src.llm.parser import parse_augmentation_response
+
+        text = (
+            "Thinking Process:\nchecking the constraints\n"
+            "<｜end▁of▁thinking｜>\n"
+            "```json\n"
+            '{"uid": "u4", "string_value": "both wrappers", "replies": []}\n'
+            "```"
+        )
+        assert parse_augmentation_response(text)["uid"] == "u4"
+
     def test_nested_json_with_braces_in_strings(self):
         from src.llm.parser import extract_json_object
 

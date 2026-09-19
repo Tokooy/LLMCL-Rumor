@@ -128,9 +128,10 @@ python scripts/joint_align.py --config configs/experiments/proposed-5.yaml --dat
 
 | 中间量 | 含义 | 期望 |
 |---|---|---|
-| `lambda_current` | 式(8) 平滑后的 CL 性能 | 稳定在 dev 准确率附近，不剧烈震荡 |
+| `lambda_current` | 式(8) 平滑后的 CL 性能（epoch 级，用于监控） | 稳定在 dev 准确率附近，不剧烈震荡 |
+| `lambda_cycle` / `lambda_cycle_previous` | 合并时实际使用的周期级 λ（式(7) 的 α 插值） | 每轮微调推进一格 |
 | `omega` | 式(9) 得到的本轮权重 | 随 λ 上升而上升，落在 `[0.05, 0.95]` |
-| `merges[].report.sparsity_after_trim` | Algorithm 1 修剪后的稀疏度 | 接近 `trim_percent/100` |
+| `merges[].report.sparsity_after_trim` | Algorithm 1 修剪后**被剪掉**的比例 | ≈ `1 - trim_percent/100`（默认 q=20 → 约 0.8） |
 | `merges[].report.merge_rate` | 符号一致被保留的比例 | 0.3~0.8 之间；过低说明任务向量间符号冲突严重 |
 | `merges[].scaling` | 写回模型时的缩放 | `(1-α)·λ_m + α·λ_{m-1}`，α=0.5 时≈两者均值 |
 

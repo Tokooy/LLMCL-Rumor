@@ -510,6 +510,65 @@ class TestPairDataset:
         assert len(batch["augmented"]) == 1
         # 只有前两条样本参与该层
         assert batch["augmented"][0]["input_ids"].shape[0] == 2
+        # 关键：必须同时给出"第 0 层由哪些样本组成"的下标
+        assert batch["augmented_indices"] == [[0, 1]]
+
+    def test_collate_pairs_indices_are_not_a_prefix(self, demo_records):
+        """回归测试：层成员在 batch 中**不是前缀**时，下标必须如实反映。
+
+        构造 ``n_augmented = [0, 1, 1, 1]``：第 0 层只含第 1、2、3 个样本。
+        若下游用 ``[:count]`` 切片（即取第 0、1、2 个），锚点就会和别人的增强样本配对。
+        """
+        require_torch()
+        from data.dataset import PairDataset, collate_pairs
+        from data.processors.data_model import record_to_instance
+
+        originals = [record_to_instance(record) for record in demo_records[:4]]
+        # 只给后三条样本配增强样本 → 第一条（index 0）没有
+        augmented = []
+        for record in demo_records[1:4]:
+            payload = dict(record)
+            payload["string_value"] = "rewritten " + record["string_value"]
+            payload["augmented"] = True
+            payload["augment_round"] = 1
+            payload["original_uid"] = record["uid"]
+            augmented.append(record_to_instance(payload))
+
+        dataset = PairDataset(
+            originals=originals, augmented=augmented,
+            tokenizer=None, max_seq_length=8, augmented_round=1,
+        )
+        batch = collate_pairs([dataset[index] for index in range(4)])
+        assert batch["n_augmented"] == [0, 1, 1, 1]
+        assert batch["augmented_indices"] == [[1, 2, 3]], batch["augmented_indices"]
+        # 层内样本数 == 下标个数
+        assert batch["augmented"][0]["input_ids"].shape[0] == len(
+            batch["augmented_indices"][0]
+        )
+
+    def test_collate_pairs_uniform_has_no_indices(self, demo_records):
+        """份数一致时返回 [B,K,L] 张量，indices 为 None（天然按下标对齐）。"""
+        require_torch()
+        from data.dataset import PairDataset, collate_pairs
+        from data.processors.data_model import record_to_instance
+
+        originals = [record_to_instance(record) for record in demo_records[:3]]
+        augmented = []
+        for record in demo_records[:3]:
+            payload = dict(record)
+            payload["string_value"] = "rewritten " + record["string_value"]
+            payload["augmented"] = True
+            payload["augment_round"] = 1
+            payload["original_uid"] = record["uid"]
+            augmented.append(record_to_instance(payload))
+
+        dataset = PairDataset(
+            originals=originals, augmented=augmented,
+            tokenizer=None, max_seq_length=8, augmented_round=1,
+        )
+        batch = collate_pairs([dataset[index] for index in range(3)])
+        assert batch["augmented_indices"] is None
+        assert batch["augmented"]["input_ids"].shape == (3, 1, 8)
 
     def test_group_by_uid(self, demo_instances, demo_records):
         require_torch()

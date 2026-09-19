@@ -125,6 +125,7 @@ def compute_loss(
     outputs: Mapping[str, Any],
     labels: Any,
     group_ids: Optional[Sequence[Any]] = None,
+    augmented_indices: Optional[Sequence[Sequence[int]]] = None,
 ) -> Dict[str, Any]:
     """把模型输出与损失函数接起来，返回损失字典。
 
@@ -133,9 +134,14 @@ def compute_loss(
     * **份数一致**（``augmented_projection`` 是 ``[B, K, d]`` 张量）：
       直接交给 :class:`CombinedLoss`，一次算完全 batch 的交叉熵与 InfoNCE；
     * **份数不一致**（是长度为 K 的列表，第 k 层只含"至少有 k 份增强样本"的样本）：
-      交叉熵**仍然在全 batch 上算一次**（分类损失与增强份数无关，按层重复计算
-      会让 CE 被重复计入、日志口径也会失真）；InfoNCE 则逐层计算后按层内样本数
-      加权平均——每层能看到的负样本集合不同，只能在层内比较。
+      交叉熵**仍然在全 batch 上算一次**（分类损失与增强份数无关）；InfoNCE 则逐层
+      计算后按层内样本数加权平均——每层能看到的负样本集合不同，只能在层内比较。
+
+    Args:
+        augmented_indices: ``collate_pairs`` 给出的、每层成员在 batch 中的**下标**。
+            列表形态下必须提供：这些成员在 batch 里不是前缀（乱序后几乎总不是），
+            按 ``[:count]`` 切片会把 A 的锚点与 B 的增强样本配成正样本且不报错。
+            为兼容手工构造的输入，缺省时退化为"假定是前缀"，但会记录一条警告。
     """
     augmented = outputs.get("augmented_projection")
 
@@ -146,15 +152,23 @@ def compute_loss(
         losses: List[Any] = []
         weights: List[int] = []
         cl_values: List[float] = []
-        for layer in augmented:
+        for layer_index, layer in enumerate(augmented):
             count = layer.shape[0]
             if count == 0:
                 continue
+            if augmented_indices is not None and layer_index < len(augmented_indices):
+                indices = list(augmented_indices[layer_index])
+            else:
+                # 兼容路径：没有下标信息时按前缀处理
+                indices = list(range(count))
+            index_tensor = torch.as_tensor(indices, device=outputs["projection"].device)
             cl_loss = criterion.contrastive(
-                outputs["projection"][:count],
+                outputs["projection"].index_select(0, index_tensor),
                 layer.unsqueeze(1),
-                labels=labels[:count],
-                group_ids=list(group_ids)[:count] if group_ids else None,
+                labels=labels.index_select(0, index_tensor),
+                group_ids=(
+                    [group_ids[index] for index in indices] if group_ids else None
+                ),
             )
             losses.append(cl_loss)
             weights.append(count)

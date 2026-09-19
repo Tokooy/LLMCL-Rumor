@@ -253,8 +253,15 @@ def collate_pairs(batch: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """把 :class:`PairDataset` 的 batch 整理成模型输入。
 
     Returns:
-        ``{"uid", "label", "original", "augmented", "n_augmented"}``；
-        ``augmented`` 在份数对齐时为 ``[B, K, L]`` 张量，否则为 ``[[B, L], ...]`` 列表。
+        ``{"uid", "label", "original", "augmented", "n_augmented", "augmented_indices"}``。
+
+        ``augmented`` 在份数对齐时为 ``[B, K, L]`` 张量，否则为 ``[B_k, L]`` 的列表。
+        **``augmented_indices`` 是列表形态下的关键补充**：第 k 层的第 j 行来自
+        batch 中的第 ``augmented_indices[k][j]`` 个样本。下游（``compute_loss``）
+        必须用这些下标去取对应的锚点投影与标签，**不能**用 ``[:B_k]`` 切片——
+        "有 k 份增强"的样本在 batch 里并不是一个前缀（乱序后几乎总是不是），
+        按切片对齐会把 A 的锚点和 B 的增强样本配成正样本，而且不会报错。
+        份数对齐时该字段为 ``None``（第 k 层就是全体样本，按下标对齐）。
     """
     _require_torch()
     uids = [item["uid"] for item in batch]
@@ -263,8 +270,9 @@ def collate_pairs(batch: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 
     counts = {item["n_augmented"] for item in batch}
     augmented: Any
+    augmented_indices: Optional[List[List[int]]] = None
     if len(counts) == 1 and counts != {0}:
-        # 份数一致：直接堆成 [B, K, L]
+        # 份数一致：直接堆成 [B, K, L]，第 k 层天然对应全体样本
         stacked = [
             _stack([item["augmented"][k] for item in batch])
             for k in range(counts.pop())
@@ -274,18 +282,25 @@ def collate_pairs(batch: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             for key in ("input_ids", "attention_mask", "token_type_ids")
         }
     else:
-        # 份数不一致（或全部为 0）：返回列表，由损失函数按最小份数对齐
+        # 份数不一致：逐层返回，并给出每层的成员下标
         max_k = max((item["n_augmented"] for item in batch), default=0)
         augmented = []
+        augmented_indices = []
         for k in range(max_k):
-            members = [item for item in batch if item["n_augmented"] > k]
-            augmented.append(_stack([item["augmented"][k] for item in members]))
+            members = [
+                index for index, item in enumerate(batch) if item["n_augmented"] > k
+            ]
+            if not members:
+                continue
+            augmented.append(_stack([batch[index]["augmented"][k] for index in members]))
+            augmented_indices.append(members)
 
     return {
         "uid": uids,
         "label": labels,
         "original": originals,
         "augmented": augmented,
+        "augmented_indices": augmented_indices,
         "n_augmented": [item["n_augmented"] for item in batch],
     }
 

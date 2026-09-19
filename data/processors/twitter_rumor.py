@@ -369,10 +369,17 @@ def assign_splits(
         n_train = int(round(n_total * train_ratio))
         n_dev = int(round(n_total * dev_ratio))
 
-        # 保证每个类别在 train/dev 至少各有一条（样本量 > 2 时）
-        if n_total > 2:
+        # 每个类别在 train/dev 至少各有一条（样本量足够时）；
+        # 同时**必须给 test 留至少一条**——否则小类别会变成 4/1/0 的划分，
+        # test.jsonl 里的该类别为空，逐类 F1 直接失真，纯 Python 的划分测试也会失败。
+        if n_total >= 3:
             n_train = max(1, n_train)
-            n_dev = max(1, n_dev) if dev_ratio > 0 else 0
+            if dev_ratio > 0:
+                n_dev = max(1, n_dev)
+        if n_total >= 4:
+            # 先给 test 预留 1 条，再回退压缩 train/dev
+            n_dev = min(n_dev, max(1, n_total - 2))
+            n_train = min(n_train, max(1, n_total - n_dev - 1))
         n_test = n_total - n_train - n_dev
         if n_test < 0:
             # 极端小样本时的兜底：优先保证 test

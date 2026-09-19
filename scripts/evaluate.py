@@ -188,7 +188,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # t-SNE
     # ------------------------------------------------------------------ #
     if not args.no_tsne and bool(config.get_path("visualization.tsne.enabled", True)):
-        from src.training.visualize import plot_feature_distribution, save_tsne_coordinates
+        from src.training.visualize import (
+            plot_feature_distribution,
+            reduce_tsne_with_indices,
+            save_tsne_coordinates,
+        )
 
         features, labels, uids = extract_features(
             model, dataloader, device, use_projection=True, max_samples=args.tsne_samples
@@ -197,26 +201,40 @@ def main(argv: Optional[List[str]] = None) -> int:
             REPO_ROOT, config.get_path("paths.figure_dir", "outputs/figures")
         )
         figure_path = os.path.join(figure_dir, f"tsne_{experiment}_{dataset}_{args.split}.png")
-        _figure, _axis, coordinates = plot_feature_distribution(
+        plot_perplexity = (
+            args.tsne_perplexity
+            if args.tsne_perplexity is not None
+            else float(config.get_path("visualization.tsne.perplexity", 30.0))
+        )
+        plot_iterations = int(config.get_path("visualization.tsne.n_iter", 1000))
+        plot_max_samples = int(config.get_path("visualization.tsne.sample_size", 0) or 0)
+
+        # 先算坐标并拿回采样下标，再用同一组下标取标签——这样即便 t-SNE 做了下采样，
+        # 图上每个点的颜色与 save_tsne_coordinates 里的 uid 也都是对的。
+        coordinates, sampled_indices = reduce_tsne_with_indices(
+            features,
+            perplexity=plot_perplexity,
+            n_iter=plot_iterations,
+            seed=seed,
+            max_samples=plot_max_samples,
+        )
+        plot_feature_distribution(
             features,
             labels,
             title=f"{experiment} on {dataset} ({args.split})",
             output_path=figure_path,
-            perplexity=(
-                args.tsne_perplexity
-                if args.tsne_perplexity is not None
-                else float(config.get_path("visualization.tsne.perplexity", 30.0))
-            ),
-            n_iter=int(config.get_path("visualization.tsne.n_iter", 1000)),
+            perplexity=plot_perplexity,
+            n_iter=plot_iterations,
             seed=seed,
-            max_samples=int(config.get_path("visualization.tsne.sample_size", 0) or 0),
+            max_samples=plot_max_samples,
             label_list=label_list,
+            coordinates=coordinates,
         )
         save_tsne_coordinates(
             os.path.join(output_dir, f"{args.split}_tsne.jsonl"),
             coordinates,
-            labels,
-            uids=uids,
+            labels[sampled_indices],
+            uids=[uids[index] for index in sampled_indices] if uids else None,
             label_list=label_list,
         )
         logger.info(f"t-SNE 图已保存：{figure_path}")

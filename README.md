@@ -3,9 +3,10 @@
 **基于 LLM 增强对比学习的社交网络虚假信息检测** —— 论文方法的代码复现。
 
 > 复现对象：《基于LLM增强对比学习的社交网络虚假信息检测方法》(2025-01-22)
-> 代码起点：开源项目 `BERT/Bert-TextClassification-master`（BERT 文本分类基线），
+> 代码起点：开源项目 `Bert-TextClassification-master`（BERT 文本分类基线），
 > 本仓库在其基础上按论文方法重构为标准的深度学习项目结构。
-> 原项目代码已完整保留在 `src/models/backbones/` 与 `docs/differences_from_baseline.md` 中可查。
+> 原项目代码已完整保留在 `reference/baseline/`（只读快照），
+> 改造范围的逐项对照见 `docs/differences_from_baseline.md`。
 
 ---
 
@@ -81,7 +82,12 @@ LLMCL-Rumor/
 | `projector.py` | MLP 投影头 `W2·σ(W1·h)`，论文式(1) |
 | `classifier.py` | 全连接 + softmax 分类器，论文式(4) |
 | `cl_model.py` | 总装：编码器 + 投影头 + 分类器，一次前向返回 logits / 投影特征 / 句向量 |
-| `backbones/` | 原开源项目保留的其它文本分类骨干（BertCNN/LSTM/ATT/RCNN/DPCNN/HAN），**论文未使用**，仅供对照与消融 |
+| `tokenization.py` | BERT 分词（数据集契约，不含模型权重） |
+
+> 论文的 CL 网络只用到"BERT + MLP 投影头 + 分类器"三部分，**没有使用**原开源项目里的
+> CNN / LSTM / 注意力池化骨干，因此本目录不包含它们。那些骨干的完整代码在
+> `reference/baseline/`（原项目快照，只读）。要做"换池化方式"的消融时，
+> 把对应文件复制进来并在 `cl_model.ContrastiveModel` 里替换池化方式即可。
 
 ### 2.4 `src/llm/` —— LLM 侧（论文 §3.1 与 §3.3）
 
@@ -107,7 +113,7 @@ LLMCL-Rumor/
 | `joint_trainer.py` | **Algorithm 2** 的联合对齐主循环（增强 → 训练 → λ/ω 更新 → 微调 → TIES 合并） |
 | `evaluate.py` | ACC / 逐类 F1 / Avg F1，对应论文 Table 3–8 |
 | `visualize.py` | t-SNE 特征分布图，对应论文 Fg.7–Fg.10 |
-| `optim.py` | 优化器与学习率调度（含分层学习率、warmup） |
+| `cl_trainer.py` | 单个增强轮次内的 CL 训练与验证（含优化器与学习率调度） |
 
 ### 2.6 `scripts/` —— 入口
 

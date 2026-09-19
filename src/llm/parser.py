@@ -50,16 +50,43 @@ DEFAULT_OVERLAP_MAX = 0.75
 # 约束 C4：改写后长度相对原样本的合理区间（防止摘要化或凭空扩写）
 DEFAULT_LENGTH_RATIO_RANGE: Tuple[float, float] = (0.5, 2.5)
 
-# 推理型模型可能输出的思考标签，必须剥掉
+# 推理型模型可能输出的思考块，必须剥掉
 _THINK_TAGS = ("think", "thinking", "reasoning", "analysis")
+
+# 推理块的**闭合**标签在各模型里写法不同，实测至少三种：
+#   DeepSeek-R1 等：   thinking ... <｜end▁of▁thinking｜>
+#   Qwen3 等：         thinking ... <｜end▁of▁thinking｜>          （闭合标签自带前缀，不是 </think>）
+#   Harmony 风格：    <|channel|>analysis<|message|> ... <|end|>
+# 只写 `</{tag}>` 只能匹配第一种，对 Qwen 会完全失效——那时抽取只能靠括号扫描，
+# 而思考过程里经常出现示例 JSON，扫描可能抽出错误对象。
+_THINK_BLOCK_PATTERNS = (
+    r"<{tag}>.*?</{tag}\s*>",              # </think>（允许闭合标签内有空白）
+    r"<\|{tag}\|>.*?<\|end\|>",            # <|think|> ... <|end|>
+    r"<\|channel\|>\s*{tag}\s*<\|message\|>.*?<\|end\|>",   # Harmony 风格
+)
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*|\s*```\s*$")
+
+
+def _think_block_regex(tag: str) -> re.Pattern:
+    """把某个思考块标签的所有已知写法编译成一个正则。
+
+    不同写法的闭合标签差异很大（``</think>`` vs ``</think>`` vs ``<|end|>``），
+    因此把候选模式用 ``|`` 连起来，一次性替换掉所有形态。
+    """
+    alternatives = "|".join(
+        pattern.format(tag=re.escape(tag)) for pattern in _THINK_BLOCK_PATTERNS
+    )
+    return re.compile(f"(?:{alternatives})", re.DOTALL | re.IGNORECASE)
+
+
+_THINK_REGEXES = tuple(_think_block_regex(tag) for tag in _THINK_TAGS)
 
 
 # ---------------------------------------------------------------------- #
 # 文本清洗与 JSON 抽取
 # ---------------------------------------------------------------------- #
 def strip_wrappers(text: str) -> str:
-    """剥掉 markdown 代码围栏、推理标签与常见前后缀。"""
+    """剥掉 markdown 代码围栏与推理模型的思考块。"""
     if not text:
         return ""
     result = text.strip()
@@ -70,10 +97,17 @@ def strip_wrappers(text: str) -> str:
         result = _FENCE_RE.sub("", result, count=1)
         result = result.strip()
 
-    # 剥  thinking...<｜end▁of▁thinking｜>
+    # 剥思考块（含 Qwen 的 </think> 写法）
+    for regex in _THINK_REGEXES:
+        result = regex.sub("", result).strip()
+
+    # 兜底：闭合标签写成了非标准形态时，"<tag>" 之后到文本末尾的整段都不可信，
+    # 但如果剥掉后什么都不剩，说明真正的答案就在里面，此时保留原文交给 JSON 扫描。
     for tag in _THINK_TAGS:
-        pattern = re.compile(rf"<{tag}>.*?</{tag}>", re.DOTALL | re.IGNORECASE)
-        result = pattern.sub("", result).strip()
+        if f"<{tag}>" in result:
+            candidate = result.split(f"<{tag}>")[0].strip()
+            if candidate:
+                result = candidate
 
     # 剥常见前缀
     for prefix in ("Output:", "OUTPUT:", "Result:", "Answer:", "JSON:"):

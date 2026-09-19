@@ -13,10 +13,24 @@
 因此本模块提供两种配对策略（配置项 ``model.contrastive.pairing``）：
 
 ``paired``（默认，严格照论文）
-    只有 **(原样本, 它自己的增强样本)** 互为正样本；同一 batch 内其它所有样本
-    ——**包括同标签的样本**——在计算 InfoNCE 时都被屏蔽为"既非正也非负"。
-    屏蔽是必要的：同一 batch 里不同原样本的副本互为"锚点-正样本"关系，
-    若不屏蔽，配对模式就退化成有监督对比学习，与论文描述不符。
+    只有 **(原样本, 它自己的增强样本)** 互为正样本。
+
+    实现方式是"锚点 × 正样本"的**交叉**相似度矩阵（``[B, B]``），第 i 行第 i 列
+    是对角正样本、其余 ``B-1`` 列就是论文所说的负样本 ``(x_i, x'_j)``，对角目标做
+    交叉熵；再对称地算一次反方向取平均。这样每个锚点看到 ``B-1`` 个负样本。
+
+    需要屏蔽的是**同一原样本的其它副本**（``copies_per_sample > 1`` 或多轮增强
+    一起用时会出现）——它们既不该当正样本、也不该当负样本，因此从 logsumexp
+    里排除。若不屏蔽，``z_i`` 会把 ``z'_i^{(2)}`` 当成负样本，这是错的。
+
+    Note:
+        论文表述为"参与损失计算的样本包括原始样本及其增强样本，数量为 2B"。
+        本实现与它在**配对语义**上一致（对角为正、其余为负），但负样本数量不同：
+        把 2B 个样本拼成一个矩阵时，每个锚点有 ``2B-2`` 个负样本
+        （其它锚点与其它正样本都算），而本实现是 ``B-1``。两者都是 InfoNCE 的
+        合法变体；这里选 ``[B, B]`` 形式是因为它与"配对正样本"的定义最直接对应，
+        且显存开销是 ``O(B²)`` 而不是 ``O(4B²)``。差异记录在
+        ``docs/architecture.md`` 与 ``docs/implementation_notes.md``。
 
 ``supervised``（消融备选）
     同标签样本互为正样本（SupCon 形式），用于回答"论文为何不直接做有监督对比"。
@@ -197,8 +211,15 @@ def supervised_contrastive_loss(
         return similarity.sum() * 0.0
 
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    # 只对"确有正样本"的行求均值，避免 0/0
-    mean_log_prob = (positive_mask * log_prob).sum(dim=1)[valid] / (
+    # 只对"确有正样本"的行求均值，避免 0/0。
+    # 注意：这里必须用 torch.where 而不是 `positive_mask * log_prob`——
+    # positive_mask 是 bool，与 float 相乘会提升为 float32，于是被屏蔽位置上的
+    # 0.0 * (-inf) = NaN，整个 loss 变成 NaN（配对的 InfoNCE 路径也出于同样原因
+    # 用了 where，见 paired_infonce_loss）。
+    masked_log_prob = torch.where(
+        positive_mask, log_prob, torch.zeros_like(log_prob)
+    )
+    mean_log_prob = masked_log_prob.sum(dim=1)[valid] / (
         positive_count[valid].float() + eps
     )
     return -mean_log_prob.mean()

@@ -240,13 +240,34 @@ class TestCombinedLoss:
         assert components["cl_loss"] == 0.0
         assert components["loss"].item() == pytest.approx(components["ce_loss"], rel=1e-5)
 
-    def test_negative_mask_blocks_same_group(self):
-        """K>1 份增强样本时必须屏蔽同一原样本的其它副本，否则配对模式失真。"""
+    def test_negative_mask_all_true_equals_no_mask(self):
+        """全 True 的掩码等价于不传掩码（掩码语义：True = 允许作为负样本）。"""
+        from src.training.losses import paired_infonce_loss
+
+        torch.manual_seed(0)
+        batch = 3
+        anchor = torch.randn(batch, 8)
+        positive = anchor + 0.1 * torch.randn(batch, 8)
+        all_true = torch.ones(batch, batch, dtype=torch.bool)
+
+        with_mask = paired_infonce_loss(anchor, positive, 0.07, negative_mask=all_true)
+        without_mask = paired_infonce_loss(anchor, positive, 0.07, negative_mask=None)
+        assert with_mask.item() == pytest.approx(without_mask.item(), rel=1e-6)
+
+    def test_group_mask_reduces_loss_when_copies_are_similar(self):
+        """屏蔽"同一原样本的其它副本"必须降低 InfoNCE —— 这是掩码正确性的判据。"""
         from src.training.losses import ContrastiveLoss
 
-        criterion = ContrastiveLoss(temperature=0.1, pairing="paired")
-        anchor = torch.randn(3, 8)
-        copies = torch.randn(3, 2, 8)
-        # 两条样本属于同一 group（不应互为负样本）时，结果不应报错且保持有限
-        loss = criterion(anchor, copies, group_ids=[0, 0, 1])
-        assert torch.isfinite(loss)
+        criterion = ContrastiveLoss(temperature=0.07, pairing="paired")
+        batch = 4
+        torch.manual_seed(1)
+        anchor = torch.randn(batch, 16)
+        shared = anchor + 0.01 * torch.randn(batch, 16)
+        # [B, 2, d]：两份副本几乎相同
+        copies = torch.stack([shared, shared + 0.001 * torch.randn(batch, 16)], dim=1)
+
+        # 每条样本独立成组（等价于"不屏蔽副本"）→ 副本互为负样本
+        loss_ungrouped = criterion(anchor, copies, group_ids=list(range(batch)))
+        # 两两同组（屏蔽副本之间的负样本关系）
+        loss_grouped = criterion(anchor, copies, group_ids=[0, 0, 1, 1])
+        assert loss_grouped.item() < loss_ungrouped.item()

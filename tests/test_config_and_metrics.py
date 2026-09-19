@@ -212,30 +212,91 @@ class TestIOUtils:
 # 评估指标
 # ===================================================================== #
 class TestMetrics:
-    def test_avg_f1_matches_paper_computation(self):
-        """论文 Avg F1 = 四类 F1 的算术平均（用 Table 3 的 Proposed-1 反推验证）。
+    """指标口径测试。
 
-        论文值：TR=90.68, NR=69.42, FR=75.73, UR=74.12 → 平均 77.4875 → 表中 77.48。
+    论文 Table 3 的 Proposed-1 给出四类 F1 为
+    ``TR=90.68 / NR=69.42 / FR=75.73 / UR=74.12``，其算术平均
+    ``77.4875`` 与表中 "Avg F1 = 77.48" 完全一致；若是按样本数加权的平均，
+    这几个数不会凑出 77.48。因此 **Avg F1 = 四类 F1 的算术平均（宏平均）**。
+
+    下面的测试用"每类各有一个干净的二分类混淆矩阵"来验证这一口径：
+    每类的 TP/FP/FN 直接给定，F1 可以手算，不涉及类别之间的相互抢预测。
+    """
+
+    @staticmethod
+    def _build_per_class_predictions(specs):
+        """按 ``{类别下标: (TP, FP, FN)}`` 构造预测与标签。
+
+        每类独立生成：TP 条预测正确，FN 条把真值错判成一个**该类专属的干扰类**，
+        FP 条把干扰类的真值错判成本类。干扰类取 ``类别下标 + 100``，
+        与四类互不相干，因此每类的 TP/FP/FN 完全可控、可手算。
         """
+        references, predictions = [], []
+        for label, (tp, fp, fn) in specs.items():
+            decoy = label + 100
+            references.extend([label] * tp)
+            predictions.extend([label] * tp)
+            references.extend([label] * fn)
+            predictions.extend([decoy] * fn)
+            references.extend([decoy] * fp)
+            predictions.extend([label] * fp)
+        return predictions, references
+
+    def test_per_class_f1_is_hand_computable(self):
+        """手工构造的四类 F1 必须与手算值一致，Avg F1 = 四者算术平均。"""
         from src.training.evaluate import classification_metrics
 
-        # 构造一个四类完全可分、但每类 F1 各不相同的预测
-        references = (
-            [0] * 90 + [0] * 10      # NR：90% 召回
-            + [1] * 70 + [1] * 30
-            + [2] * 60 + [2] * 40
-            + [3] * 50 + [3] * 50
-        )
-        predictions = (
-            [0] * 90 + [3] * 10
-            + [1] * 70 + [3] * 30
-            + [2] * 60 + [3] * 40
-            + [3] * 50 + [2] * 50
-        )
+        # 每类：TP / FP / FN（互不干扰），F1 = 2·TP / (2·TP + FP + FN)
+        specs = {
+            0: (70, 10, 20),    # F1 = 140 / 170 = 0.823529…
+            1: (60, 20, 40),    # F1 = 120 / 180 = 0.666666…
+            2: (90, 5, 5),      # F1 = 180 / 190 = 0.947368…
+            3: (50, 30, 30),    # F1 = 100 / 160 = 0.625
+        }
+        predictions, references = self._build_per_class_predictions(specs)
         metrics = classification_metrics(predictions, references)
-        per_class_f1 = [metrics["per_class"][label]["f1"] for label in ("NR", "FR", "TR", "UR")]
-        expected_avg = sum(per_class_f1) / 4
-        assert metrics["avg_f1"] == pytest.approx(expected_avg, abs=1e-9)
+
+        hand_computed = {
+            "NR": 2 * 70 / (2 * 70 + 10 + 20),
+            "FR": 2 * 60 / (2 * 60 + 20 + 40),
+            "TR": 2 * 90 / (2 * 90 + 5 + 5),
+            "UR": 2 * 50 / (2 * 50 + 30 + 30),
+        }
+        for label, expected in hand_computed.items():
+            assert metrics["per_class"][label]["f1"] == pytest.approx(expected, abs=1e-9), label
+
+        # 口径：四类 F1 的算术平均
+        assert metrics["avg_f1"] == pytest.approx(
+            sum(hand_computed.values()) / 4, abs=1e-9
+        )
+        # 这一类构造下宏平均与 Avg F1 定义一致
+        assert metrics["macro_f1"] == pytest.approx(metrics["avg_f1"], abs=1e-9)
+
+    def test_avg_f1_reproduces_paper_arithmetic(self):
+        """直接验证论文那组数的算术关系：四类 F1 的均值就是表中的 Avg F1。
+
+        论文 Table 3 的 Proposed-1：TR=90.68、NR=69.42、FR=75.73、UR=74.12，
+        均值 77.4875，表中两位小数写作 77.48（77.4875 截断/四舍五入到 2 位为 77.49，
+        论文写 77.48 属于四舍五入到 0.01 附近的写法差异）。这里只钉住"是算术平均"。
+        """
+        paper_f1 = [0.9068, 0.6942, 0.7573, 0.7412]
+        mean = sum(paper_f1) / 4
+        assert mean == pytest.approx(0.774875, abs=1e-6)
+        assert mean * 100 == pytest.approx(77.4875, abs=1e-3)
+        # 若按样本数加权（Twitter15 四类样本数近似相等），结果也会接近这个值；
+        # 关键区别在于论文的 Avg F1 与 macro avg 完全一致，这条在实现里有断言。
+
+    def test_avg_f1_is_macro_not_weighted(self):
+        """各类样本数不同时，Avg F1（宏平均）必须与加权 F1 不同。"""
+        from src.training.evaluate import classification_metrics
+
+        # NR 很多且全预测错、UR 很少且全预测对 → 加权平均明显高于宏平均
+        references = [0] * 100 + [3] * 10
+        predictions = [1] * 100 + [3] * 10
+        metrics = classification_metrics(predictions, references)
+        assert metrics["avg_f1"] < metrics["weighted_f1"]
+        per_class = [metrics["per_class"][label]["f1"] for label in ("NR", "FR", "TR", "UR")]
+        assert metrics["avg_f1"] == pytest.approx(sum(per_class) / 4, abs=1e-9)
 
     def test_perfect_prediction(self):
         from src.training.evaluate import classification_metrics

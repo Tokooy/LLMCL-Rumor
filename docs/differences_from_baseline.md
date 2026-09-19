@@ -101,24 +101,26 @@ LLMCL-Rumor/
 | `train_evalute.py` 的早停与"按 dev 最优保存" | `src/training/cl_trainer.py::CLTrainer.run` | 保留 `save_best_on` 与 `early_stop_patience` 两项配置 |
 | `main.py` 的 `no_decay` 参数分组 | `src/training/cl_trainer.py::build_optimizer` | bias / LayerNorm 不做权重衰减 |
 | `Utils/Classifier_utils.py` 的特征转换流程 | `data/dataset.py` + `src/models/tokenization.py` | 保留 `[CLS] ... [SEP]` 与 `input_mask`/`segment_ids` 三件套 |
-| 多模型对照的思路 | `src/models/backbones/` | 见下 |
+| 多模型对照的思路 | `reference/baseline/`（只读快照） | 见下 |
 
 ---
 
-## 4. `src/models/backbones/` 是什么
+## 4. 其它骨干（CNN / LSTM / 注意力）放在哪里
 
 原项目的七个模型目录（BertOrigin / BertCNN / BertLSTM / BertATT / BertRCNN /
-BertCNNPlus / BertDPCNN）以及 `BertHAN`、`Models/`、`Processors/` 全部原样保留，
-放在 `src/models/backbones/` 下作为**只读参考实现**。
+BertCNNPlus / BertDPCNN）以及 `BertHAN`、`Models/`、`Processors/`**全部原样保留**，
+但**没有**迁进 `src/`，而是作为只读快照放在 `reference/baseline/` 下。
 
 **论文只用到 BERT 编码器 + MLP 投影头 + 全连接分类器**，也就是新结构里的
-`encoder.py` + `projector.py` + `classifier.py`。保留 backbones 的目的：
+`encoder.py` + `projector.py` + `classifier.py`。把它们留在 `src/` 里会造成两个误解：
+读者以为主流程会用到它们；静态自检也会把 `pytorch_pretrained_bert` 的旧 API 当成项目代码。
+放快照同样能达到"可追溯、可消融"的目的：
 
-1. 便于对照"改造范围到底有多大"；
-2. 便于做消融实验（"把 [CLS] 换成 CNN 池化会不会更好"）；
+1. 便于对照"改造范围到底有多大"（`reference/README.md` 有逐文件对照表）；
+2. 便于做消融实验——把需要的 `BertXXX.py` 复制进 `src/models/` 再接入即可；
 3. 如果将来要做"论文方法的 GNN 版本"，这些池化结构可以直接复用。
 
-它们**不被主流程引用**，可以整体删除而不影响任何脚本。
+主流程**不引用** `reference/` 下的任何文件，该目录可以整体删除而不影响任何脚本。
 
 ---
 

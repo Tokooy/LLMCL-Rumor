@@ -35,7 +35,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .task_vector import TaskVector
 
@@ -67,7 +67,13 @@ class TrimResult:
 
 @dataclass
 class MergeReport:
-    """合并过程的诊断信息（写入日志/结果文件，便于核查 Algorithm 1 的行为）。"""
+    """合并过程的诊断信息（写入日志/结果文件，便于核查 Algorithm 1 的行为）。
+
+    注意两个容易混淆的比率：
+
+    * :attr:`sparsity_after_trim` 是**修剪掉**的比例，约等于 ``1 - q/100``；
+    * :attr:`trim_percent` 是**保留**的比例 ``q``。
+    """
 
     num_vectors: int = 0
     num_parameters: int = 0
@@ -81,6 +87,7 @@ class MergeReport:
 
     @property
     def sparsity_after_trim(self) -> float:
+        """修剪后被置 0 的元素占比（≈ ``1 - trim_percent/100``）。"""
         if not self.total_entries:
             return 0.0
         return 1.0 - (self.kept_entries / self.total_entries)
@@ -112,36 +119,47 @@ class MergeReport:
 # 第 1 步：修剪
 # ---------------------------------------------------------------------- #
 def trim_task_vector(vector: Mapping[str, Any], trim_percent: float) -> Dict[str, Any]:
-    """**Algorithm 1 第 3 行（Trim）**：只保留幅值前 q% 的参数，其余置 0。
+    """**Algorithm 1 第 3 行（Trim）**。
+
+    ``trim_percent`` 的语义 = **保留**幅值最大的前 ``q%``，其余置 0。
+    这与论文原文"magnitude 的前 q% 被保留，其余被设置为 0"以及
+    TIES-Merging[35] 的 ``k = 20%``（keep top-20%）一致。
 
     Args:
         vector: ``{参数名: 张量}``。
-        trim_percent: ``q``，取值 ``[0, 100)``。0 表示不修剪。
+        trim_percent: ``q``，**保留**百分比，取值 ``(0, 100]``。
 
     Returns:
-        新的字典，形状与键与输入一致，只是部分元素被置 0。
+        新的字典，键与形状与输入一致，只是被剪掉的元素置 0。
 
     Note:
         阈值按**整个向量的全局分位数**计算，而不是逐参数张量各算一次。
         TIES-Merging 原文也是全局层面比较幅值（同一个 entry 在不同任务向量间
         比较才有意义），逐张量分位数会让小张量的噪声被放大。
+
+    Note:
+        语义容易搞反，这里写明换算关系：``q=20`` 表示保留 20%、剪掉 80%
+        （TIES 原文默认、也是论文的写法）；想让"剪掉 20%"就传 ``q=80``。
     """
     import torch
 
     if not vector:
         return {}
-    if not 0 <= trim_percent < 100:
-        raise ValueError(f"trim_percent 必须落在 [0, 100)，收到 {trim_percent}")
+    if not 0 < trim_percent <= 100:
+        raise ValueError(
+            f"trim_percent 是**保留**百分比，须落在 (0, 100]，收到 {trim_percent}"
+        )
 
-    if trim_percent == 0:
+    if trim_percent >= 100:
         return {name: value.clone() for name, value in vector.items()}
 
     magnitudes = torch.cat([value.detach().abs().reshape(-1).float() for value in vector.values()])
     if magnitudes.numel() == 0:
         return {name: value.clone() for name, value in vector.items()}
 
-    # 保留幅值最大的 (100 - q)%；torch.quantile 给出的是"低于该值的比例"分位点
-    quantile = float(trim_percent) / 100.0
+    # 保留幅值最大的 q%：分位点取 (1 - q/100)，保留"大于等于该分位点"的元素。
+    # 例如 q=20 → 分位点 0.8 → 只留下幅值排在前 20% 的参数。
+    quantile = 1.0 - float(trim_percent) / 100.0
     threshold = torch.quantile(magnitudes, quantile)
     trimmed: Dict[str, Any] = {}
     for name, value in vector.items():
@@ -253,6 +271,24 @@ def disjoint_merge(
 # ---------------------------------------------------------------------- #
 # 组合：完整的 Algorithm 1
 # ---------------------------------------------------------------------- #
+def _count_entries(value: Any) -> Tuple[int, int]:
+    """统计一个参数张量的 ``(总元素数, 非零元素数)``。
+
+    读取失败时返回 ``(0, 0)``：**合并结果的正确性不依赖统计**，
+    因此这里宁可让诊断数据缺一点，也不能因为统计把一个"合并已经算完"的流程炸掉。
+    （这也让接口对"非张量但支持逐元素运算"的实现保持可用，便于单测用轻量替身。）
+    """
+    try:
+        total = int(value.numel())
+    except Exception:  # noqa: BLE001 - 统计失败不影响主流程
+        return 0, 0
+    try:
+        nonzero = int((value != 0).sum().item())
+    except Exception:  # noqa: BLE001
+        nonzero = 0
+    return total, nonzero
+
+
 def merge_task_vectors(
     task_vector: TaskVector,
     trim_percent: float = 20.0,
@@ -284,12 +320,13 @@ def merge_task_vectors(
         report.total_entries = 0
         report.kept_entries = 0
         report.merged_entries = 0
-        for name, value in merged.items():
-            report.total_entries += int(value.numel())
-            report.merged_entries += int((value != 0).sum().item())
+        for value in merged.values():
+            total, nonzero = _count_entries(value)
+            report.total_entries += total
+            report.merged_entries += nonzero
         for vector in trimmed:
             for value in vector.values():
-                report.kept_entries += int((value != 0).sum().item())
+                report.kept_entries += _count_entries(value)[1]
     return merged
 
 

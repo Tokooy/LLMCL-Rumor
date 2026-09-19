@@ -161,23 +161,41 @@ class TestTrimElectMerge:
     """Trim / Elect Sign / Disjoint Merge 的数值正确性（需要 torch）。"""
 
     def test_trim_keeps_top_magnitudes_percent(self):
+        """trim_percent 是**保留**百分比：q=30 表示保留幅值最大的 3/10。"""
         torch = require_torch()
         from src.llm.ties_merge import trim_task_vector
 
-        # 10 个元素，q=30 → 保留幅值最大的 7 个
+        # 10 个元素，q=30 → 保留幅值最大的 3 个
         vector = {"w": torch.arange(1, 11, dtype=torch.float32)}
         trimmed = trim_task_vector(vector, trim_percent=30.0)
         kept = int((trimmed["w"] != 0).sum().item())
-        assert kept == 7
-        # 被保留的必须是幅值最大的那些（10,9,...,4）
-        assert set(trimmed["w"][trimmed["w"] != 0].tolist()) == {4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0}
+        assert kept == 3
+        # 被保留的必须是幅值最大的那些（10, 9, 8）
+        assert set(trimmed["w"][trimmed["w"] != 0].tolist()) == {8.0, 9.0, 10.0}
 
-    def test_trim_zero_percent_keeps_everything(self):
+    def test_trim_default_matches_ties_top20(self):
+        """默认 q=20 应只保留约 20% 的参数（与 TIES 的 k=20% 一致）。"""
+        torch = require_torch()
+        from src.llm.task_vector import TaskVector
+        from src.llm.ties_merge import MergeReport, merge_task_vectors
+
+        torch.manual_seed(0)
+        container = TaskVector(
+            [{"w": torch.randn(1000)}], weights=[1.0], rounds=[1]
+        )
+        report = MergeReport()
+        merge_task_vectors(container, trim_percent=20.0, report=report)
+        kept_ratio = report.kept_entries / report.total_entries
+        assert 0.15 < kept_ratio < 0.25, f"保留比例应接近 20%，实际 {kept_ratio:.3f}"
+        # sparsity_after_trim 是"被剪掉"的比例，因此约为 0.8
+        assert report.sparsity_after_trim == pytest.approx(0.8, abs=0.05)
+
+    def test_trim_full_percent_keeps_everything(self):
         torch = require_torch()
         from src.llm.ties_merge import trim_task_vector
 
         vector = {"w": torch.tensor([0.1, -0.2, 0.3])}
-        trimmed = trim_task_vector(vector, trim_percent=0.0)
+        trimmed = trim_task_vector(vector, trim_percent=100.0)
         assert torch.allclose(trimmed["w"], vector["w"])
         # 必须是新张量，不能原地修改输入
         assert trimmed["w"] is not vector["w"]
@@ -187,9 +205,11 @@ class TestTrimElectMerge:
         from src.llm.ties_merge import trim_task_vector
 
         with pytest.raises(ValueError):
-            trim_task_vector({"w": torch.tensor([1.0])}, trim_percent=100.0)
+            trim_task_vector({"w": torch.tensor([1.0])}, trim_percent=0.0)
         with pytest.raises(ValueError):
-            trim_task_vector({"w": torch.tensor([1.0])}, trim_percent=-1.0)
+            trim_task_vector({"w": torch.tensor([1.0])}, trim_percent=120.0)
+        with pytest.raises(ValueError):
+            trim_task_vector({"w": torch.tensor([1.0])}, trim_percent=-5.0)
 
     def test_elect_sign_weighted_sum(self):
         """式(6)：sign_e = sign(Σ_m ω_m·τ_m[e])。"""
@@ -265,9 +285,9 @@ class TestTrimElectMerge:
         report = MergeReport()
         merged = merge_task_vectors(container, trim_percent=50.0, report=report)
         assert set(merged.keys()) == set(names)
-        # 修剪 50% 后，每个参数的保留比例应接近一半
+        # 保留 50%：修剪后每个参数的保留比例应接近一半
         assert report.num_vectors == 3
-        assert 0.3 < report.kept_entries / report.total_entries < 0.7
+        assert 0.4 < report.kept_entries / report.total_entries < 0.6
         # 合并结果非空且形状一致
         for name in names:
             assert merged[name].shape == (64,)

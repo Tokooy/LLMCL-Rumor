@@ -83,11 +83,9 @@ def setup_logging(
 
     key = name or "__root__"
     if key in _CONFIGURED:
-        # 已配置过：如果这次带了新的文件路径，再补一个文件 handler
-        if log_file and name is None and _ROOT_FILE_HANDLER is None:
+        # 已配置过：如果这次带了（新的）文件路径，再补一个文件 handler
+        if log_file:
             _attach_file_handler(logger, log_file)
-        elif log_file and name is not None:
-            _attach_file_handler(logger, log_file, only_if_missing=True)
         return logger
     _CONFIGURED.add(key)
 
@@ -98,7 +96,11 @@ def setup_logging(
     )
     logger.addHandler(console)
 
-    if log_file and name is None:
+    # 文件 handler 在**首次**配置时就要挂上。
+    # 曾经的写法是 `if log_file and name is None`，导致具名 logger（也就是所有脚本
+    # 实际使用的那些）第一次调用不会创建日志文件，而每个脚本只调用一次
+    # get_logger → outputs/logs/*.log 永远不会出现。
+    if log_file:
         _attach_file_handler(logger, log_file)
 
     return logger

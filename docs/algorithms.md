@@ -35,7 +35,7 @@ return ;
 
 | 论文步骤 | 论文文字描述 | 代码 | 说明 |
 |---|---|---|---|
-| 修剪 Trim | "为了去除冗余参数，在中，magnitude 的前 q% 被保留，其余被设置为 0（见第 3 行）" | `src/llm/ties_merge.py::trim_task_vector` | 阈值取**全局**分位数（所有参数一起算），与 TIES 原文一致；`q=0` 表示不修剪 |
+| 修剪 Trim | "为了去除冗余参数，在中，magnitude 的前 q% 被保留，其余被设置为 0（见第 3 行）" | `src/llm/ties_merge.py::trim_task_vector` | 阈值取**全局**分位数（所有参数一起算），与 TIES 原文一致；`trim_percent` 即**保留**百分比 q（默认 20，与 TIES `k=20%` 相同），`q=100` 表示不修剪 |
 | 分解 | "进一步被分解为 magnitute 和 sign（见第 4 行）" | `elect_sign` 内部用 `torch.sign` 与算术值 | 实现上不显式拆分，而是"符号比较 + 保留幅值"，数学等价 |
 | 选举符号 Elect Sign | "合并 τ1 和 τ2 的先决条件是解决不同向量之间的符号冲突问题（见第 8 行）"；式(6) 给出第 e 个 entry 的计算 | `src/llm/ties_merge.py::elect_sign` | 按**加权**符号和 `sign(Σ ω_m·τ_m[e])`；权重全 1 时退化为 TIES 原文的"支持强度最大者胜" |
 | 不相交合并 Disjoint Merge | "对于 τ^m 中的第 e 个参数，我们仅保留来自模型且符号与聚合后选定符号一致的参数值" | `src/llm/ties_merge.py::disjoint_merge` | 符号一致者加权平均；符号选举结果为 0 的 entry 输出 0 |
@@ -45,8 +45,8 @@ return ;
 ### 关键代码（节选）
 
 ```python
-# 第 1 步：Trim
-threshold = torch.quantile(magnitudes, trim_percent / 100.0)
+# 第 1 步：Trim —— 保留幅值前 q%（q=trim_percent），其余置 0
+threshold = torch.quantile(magnitudes, 1.0 - trim_percent / 100.0)
 trimmed[name] = torch.where(value.abs() >= threshold, value, torch.zeros_like(value))
 
 # 第 2 步：Elect Sign（论文式(6)）
@@ -57,6 +57,10 @@ signs[name] = torch.sign(accumulator)
 agree = (torch.sign(value) == sign) & (sign != 0) & (value != 0)
 merged[name] = Σ(agree * value * weight) / (Σ(agree * weight) + eps)
 ```
+
+> **不要搞反 q 的方向**：`trim_percent=20` 表示**保留 20%、剪掉 80%**
+> （论文的 q 与 TIES 的 k 都是"保留比例"）。想让"剪掉 20%"就传 `q=80`。
+> 诊断字段 `MergeReport.sparsity_after_trim` 是**被剪掉**的比例，约等于 `1 - q/100`。
 
 ### 与文献[35] TIES-Merging 的差异
 

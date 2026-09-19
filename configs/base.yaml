@@ -42,7 +42,8 @@ data:
   # 最多纳入多少条回复（控制序列长度；超出部分按 reply_order 截断）
   max_replies: 20
   # 训练时每个原始样本使用几份增强样本参与对比（w 轮增强后累计）
-  # 1 表示仅用最近一轮的增强；"all" 表示使用历史所有轮次的增强样本
+  # 正整数：每轮每样本取这么多份；0 表示取该轮全部增强样本。
+  # 注意：必须写整数，不要写 "all"（代码会 int() 转换）。
   augmented_per_sample: 1
   use_augmented: true
   # 数据划分比例（训练/验证/测试）；论文为 70% / 10% / 20%
@@ -170,8 +171,10 @@ llm:
 
   # TIES-Merging 任务向量合并（论文 Algorithm 1 + 文献[35]）
   merge:
-    trim_percent: 20         # q：只保留幅值前 q% 的参数，其余置 0
-    scaling_alpha: 0.5       # α：合并超参数；θ_final = (1-α)·θ̃ + α·θ_prev
+    # q：**保留**幅值最大的前 q% 参数，其余置 0（论文"magnitude 的前 q% 被保留"；
+    # 与 TIES-Merging 原文的 k=20% 一致）。想让"剪掉 20%"请传 80。
+    trim_percent: 20
+    scaling_alpha: 0.5       # α：合并超参数；scaling = (1-α)·λ_m + α·λ_{m-1}
     # 是否把多轮任务向量一起合并（论文 Algorithm 1 的 (τ1..τm) 形态）
     merge_all_checkpoints: true
 
@@ -211,8 +214,10 @@ training:
     max_finetune_rounds: 0
     # w：数据增强轮次上限（论文 1..3）
     max_augment_rounds: 3
-    # 每 T 个 epoch 执行一次增强（见 training.cl.augment_every_epochs 的同名说明）
-    augment_interval_epochs: 1
+    # 注意：增强节奏 T 只有一个开关，位于 training.cl.augment_every_epochs
+    #（论文 Algorithm 2 里 T 同时控制"多久增强一次"与"多久对齐一次"，
+    #  本实现把两者拆开：增强间隔用 cl.augment_every_epochs，
+    #  微调周期用下面的 finetune_interval_epochs）
     # 每多少个 epoch 完成一次"数据增强 + 微调"的完整对齐周期
     finetune_interval_epochs: 5
     # λ 的动量系数（论文式(8)的 β）

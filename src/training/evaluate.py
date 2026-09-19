@@ -236,10 +236,15 @@ def extract_features(
     with torch.no_grad():
         for batch in dataloader:
             inputs = batch.get("original", batch)
+            # 三个张量必须一起搬到 device：只搬 input_ids/attention_mask 而漏掉
+            # token_type_ids，在 GPU 上第一次调用就会 RuntimeError（device mismatch）。
+            token_type_ids = inputs.get("token_type_ids")
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(device)
             outputs = model(
                 input_ids=inputs["input_ids"].to(device),
                 attention_mask=inputs["attention_mask"].to(device),
-                token_type_ids=inputs.get("token_type_ids"),
+                token_type_ids=token_type_ids,
             )
             tensor = outputs["projection"] if use_projection else outputs.get("hidden")
             if tensor is None:

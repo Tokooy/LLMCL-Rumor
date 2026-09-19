@@ -28,6 +28,7 @@ from src.utils.logger import get_logger
 __all__ = [
     "LABEL_COLORS",
     "reduce_tsne",
+    "reduce_tsne_with_indices",
     "plot_feature_distribution",
     "plot_multiple_rounds",
     "save_tsne_coordinates",
@@ -51,6 +52,30 @@ def _require_sklearn():
     return TSNE
 
 
+def _make_tsne(TSNE, perplexity: float, iterations: int, seed: int):
+    """构造 TSNE 实例，兼容 sklearn 的 ``n_iter`` → ``max_iter`` 改名。
+
+    scikit-learn 1.5 起 ``n_iter`` 被弃用、1.7 将移除，改用 ``max_iter``；
+    而 requirements.txt 只要求 ``>=1.3.0``。这里用 ``inspect.signature`` 探测
+    当前版本接受的参数名，避免在新版上直接 TypeError，也不写死版本号比较。
+    """
+    import inspect
+
+    kwargs: Dict[str, Any] = {
+        "n_components": 2,
+        "perplexity": perplexity,
+        "random_state": int(seed),
+        "init": "pca",
+        "learning_rate": "auto",
+    }
+    parameters = inspect.signature(TSNE.__init__).parameters
+    if "max_iter" in parameters:
+        kwargs["max_iter"] = int(iterations)
+    else:  # pragma: no cover - 仅旧版 sklearn 会走到
+        kwargs["n_iter"] = int(iterations)
+    return TSNE(**kwargs)
+
+
 def reduce_tsne(
     features: Any,
     perplexity: float = 30.0,
@@ -63,12 +88,40 @@ def reduce_tsne(
     Args:
         features: ``[N, d]`` 的 numpy 数组。
         perplexity: t-SNE 的困惑度；会被自动裁剪到 ``< N``（sklearn 要求）。
-        n_iter: 迭代次数。
+        n_iter: 迭代次数（新版 sklearn 内部映射到 ``max_iter``）。
         seed: 随机种子（固定以保证可复现）。
         max_samples: ``>0`` 时先随机下采样到该规模（t-SNE 复杂度为 O(N²)）。
 
     Returns:
-        ``[N, 2]`` 的 numpy 数组。样本过少（<3）时返回零坐标。
+        ``[N', 2]`` 的 numpy 数组，``N' = min(N, max_samples)``。
+        样本过少（<3）时返回零坐标。
+
+    Note:
+        下采样会让返回行数小于输入行数。**调用方不能用"截断"来对齐标签**——
+        那样颜色会贴到错误的点上。需要与标签对齐时请用
+        :func:`reduce_tsne_with_indices` 拿到采样下标。
+    """
+    coordinates, _indices = reduce_tsne_with_indices(
+        features, perplexity=perplexity, n_iter=n_iter, seed=seed, max_samples=max_samples
+    )
+    return coordinates
+
+
+def reduce_tsne_with_indices(
+    features: Any,
+    perplexity: float = 30.0,
+    n_iter: int = 1000,
+    seed: int = 42,
+    max_samples: int = 0,
+) -> Tuple[Any, Any]:
+    """与 :func:`reduce_tsne` 相同，但**额外返回被保留样本的下标**。
+
+    Returns:
+        ``(coordinates [N', 2], indices [N'])``。``indices`` 是原始输入中的行号，
+        直接用它索引标签/uid 即可正确对齐：
+
+        >>> coords, idx = reduce_tsne_with_indices(features, max_samples=500)
+        >>> labels_for_plot = labels[idx]
     """
     import numpy as np
 
@@ -79,24 +132,18 @@ def reduce_tsne(
         raise ValueError(f"features 必须是二维数组，收到形状 {array.shape}")
     count = array.shape[0]
     if count < 3:
-        return np.zeros((count, 2), dtype="float32")
+        return np.zeros((count, 2), dtype="float32"), np.arange(count)
 
+    indices = np.arange(count)
     if max_samples and count > max_samples:
         rng = np.random.default_rng(seed)
-        indices = rng.choice(count, size=max_samples, replace=False)
+        indices = np.sort(rng.choice(count, size=max_samples, replace=False))
         array = array[indices]
 
-    # perplexity 必须小于样本数，按论文常用值 30 与 N/4 取小
+    # perplexity 必须小于样本数，按论文常用值 30 与 N/3 取小
     effective_perplexity = float(min(perplexity, max(5.0, (array.shape[0] - 1) / 3.0)))
-    reducer = TSNE(
-        n_components=2,
-        perplexity=effective_perplexity,
-        n_iter=int(n_iter),
-        random_state=int(seed),
-        init="pca",
-        learning_rate="auto",
-    )
-    return reducer.fit_transform(array)
+    reducer = _make_tsne(TSNE, effective_perplexity, iterations=int(n_iter), seed=seed)
+    return reducer.fit_transform(array), indices
 
 
 def plot_feature_distribution(
@@ -133,18 +180,30 @@ def plot_feature_distribution(
 
     classes = list(label_list or LABELS)
     label_array = np.asarray(labels).reshape(-1)
-    coords = (
-        np.asarray(coordinates, dtype="float32")
-        if coordinates is not None
-        else reduce_tsne(features, perplexity=perplexity, n_iter=n_iter, seed=seed, max_samples=max_samples)
-    )
-    if coords.shape[0] != label_array.shape[0]:
-        # 下采样过：同步裁剪标签
-        label_array = label_array[: coords.shape[0]]
+    if coordinates is not None:
+        coords = np.asarray(coordinates, dtype="float32")
+        labels_for_plot = label_array
+    else:
+        # 关键：下采样时 t-SNE 返回的行数会变少，必须用**采样下标**取标签，
+        # 不能用 label_array[:coords.shape[0]] 截断——那会把颜色贴到错误的点上。
+        coords, indices = reduce_tsne_with_indices(
+            features,
+            perplexity=perplexity,
+            n_iter=n_iter,
+            seed=seed,
+            max_samples=max_samples,
+        )
+        labels_for_plot = label_array[indices]
+    if labels_for_plot.shape[0] != coords.shape[0]:
+        raise ValueError(
+            f"标签数量 {labels_for_plot.shape[0]} 与坐标数量 {coords.shape[0]} 不一致；"
+            "若手动传入 coordinates，请确保它与 labels 一一对应（下采样时请用 "
+            "reduce_tsne_with_indices 取回采样下标）"
+        )
 
     figure, axis = plt.subplots(figsize=(7, 6))
     for index, name in enumerate(classes):
-        mask = label_array == index
+        mask = labels_for_plot == index
         if not mask.any():
             continue
         axis.scatter(
@@ -208,14 +267,15 @@ def plot_multiple_rounds(
     for index, panel in enumerate(panels):
         row, column = divmod(index, columns)
         axis = axes[row][column]
-        coords = reduce_tsne(
+        # 与 plot_feature_distribution 同样必须用采样下标对齐标签
+        coords, indices = reduce_tsne_with_indices(
             panel["features"],
             perplexity=perplexity,
             n_iter=n_iter,
             seed=seed,
             max_samples=max_samples,
         )
-        labels = np.asarray(panel["labels"]).reshape(-1)[: coords.shape[0]]
+        labels = np.asarray(panel["labels"]).reshape(-1)[indices]
         classes = list(label_list or LABELS)
         for class_index, name in enumerate(classes):
             mask = labels == class_index

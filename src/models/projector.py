@@ -70,8 +70,13 @@ class MLPProjector(nn.Module):  # type: ignore[misc]
         num_layers: 层数。1 = 单层线性；2 = ``Linear->Act->Linear``；>=3 时按
             ``input -> hidden -> ... -> output`` 搭建。
         activation: 激活函数名。
-        dropout: 隐藏层后的 dropout 概率。
+        dropout: dropout 概率。作用在**两处**：输入句向量之后（进入 MLP 之前），
+            以及每个隐藏层之后；``num_layers == 1`` 时只有输入那一处。
         normalize: 输出是否做 L2 归一化（默认 True）。
+
+    Note:
+        投影头是"用 dropout 正则化的 MLP"这一常见写法（SimCLR 系列同款），
+        因此输入处也有 dropout——这一处容易被 docstring 忽略，特意写明。
     """
 
     def __init__(

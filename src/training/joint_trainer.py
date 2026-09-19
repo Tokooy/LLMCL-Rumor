@@ -227,21 +227,53 @@ class JointAlignmentTrainer:
         self.state.lambda_current = float(lambda_init)
         self.state.lambda_previous = float(lambda_init)
 
+        # 周期级（每 m 轮微调一次）冻结的 λ / ω。
+        # 背景：论文式(8)(9) 出现在 Algorithm 2 的**周期**块里（每 T 个 epoch 一次），
+        # 而本实现在每个 epoch 都做一次 CL 评测，因此 λ 是"每 epoch 的 EMA"。
+        # 为了让式(7) 的 α 插值仍然是"本轮 vs 上一轮"而不是"本 epoch vs 上一 epoch"，
+        # 这里额外维护一对周期级快照：合并时用快照，合并后把快照推进一格。
+        self.lambda_cycle = float(lambda_init)
+        self.lambda_cycle_previous = float(lambda_init)
+        self.omega_cycle = compute_omega(float(lambda_init), self.omega_min, self.omega_max)
+
         # 运行时累积状态
         self.augment_round = 0
         self.finetune_round = 0
         self.augmented_pool: List[DataInstance] = []
         self.train_originals: List[DataInstance] = []
-        self._pending_merge: Optional[Dict[str, Any]] = None
-        self._base_vector: Optional[Dict[str, Any]] = None
         self._augment_failed = False
 
     # ------------------------------------------------------------------ #
     # 数据准备
     # ------------------------------------------------------------------ #
-    def prepare(self, train_originals: Sequence[DataInstance]) -> None:
-        """登记训练集原样本（增强与自举微调都以它为输入）。"""
+    def prepare(
+        self,
+        train_originals: Sequence[DataInstance],
+        existing_augmented: Optional[Sequence[DataInstance]] = None,
+    ) -> None:
+        """登记训练集原样本与"磁盘上已有的增强样本"。
+
+        Args:
+            train_originals: 训练集原样本（增强与自举微调都以它为输入）。
+            existing_augmented: 已经落盘、并被初始训练集使用的增强样本
+                （例如先跑过 ``scripts/augment_data.py`` 再跑 ``joint_align.py``）。
+
+        Note:
+            必须把 ``existing_augmented`` 也放进 :attr:`augmented_pool`：
+            第一轮内存增强结束后 :meth:`rebuild_train_loader` 会用"原样本 +
+            augmented_pool"重建训练集，若池子里只有新增强样本，
+            原先那些已经落盘的增强样本就会从训练集中**静默消失**，训练集反而变小。
+        """
         self.train_originals = list(train_originals)
+        if existing_augmented:
+            known = {id(item) for item in self.augmented_pool}
+            added = [item for item in existing_augmented if id(item) not in known]
+            self.augmented_pool.extend(added)
+            rounds = sorted({item.augment_round for item in added})
+            self.logger.info(
+                f"已把磁盘上现有的 {len(added)} 条增强样本纳入增强池"
+                f"（轮次 {rounds}），避免重建训练集时丢失"
+            )
 
     # ------------------------------------------------------------------ #
     # 回调
@@ -262,9 +294,8 @@ class JointAlignmentTrainer:
         augment_done = self.maybe_augment(epoch)
 
         # 3) 每 finetune_interval_epochs 个 epoch 做一次微调 + TIES 合并（含本轮增强）
-        finetune_done = False
         if self.max_finetune_rounds > 0 and epoch % self.finetune_interval_epochs == 0:
-            finetune_done = self.finetune_and_merge(epoch, augment_done)
+            self.finetune_and_merge(epoch, augment_done)
 
         if self.log_every_epochs and epoch % self.log_every_epochs == 0:
             self.logger.info(
@@ -287,11 +318,20 @@ class JointAlignmentTrainer:
         epoch: int = 0,
         dev_metrics: Optional[Mapping[str, Any]] = None,
     ) -> float:
-        """论文式(8)：``λ_m = β·f_m + (1-β)·λ_{m-1}``。"""
+        """论文式(8)：``λ_m = β·f_m + (1-β)·λ_{m-1}``（每个 epoch 调用一次）。
+
+        Note:
+            这里更新的是**epoch 级**的 :attr:`state.lambda_current`（用于监控与日志）。
+            真正参与 Algorithm 1 的 ω 取 :attr:`omega_cycle`（周期级快照），
+            因为它必须与式(7) 的 α 插值同尺度——见 :meth:`finetune_and_merge`。
+        """
         updated = self.merger.update_lambda(score, beta=self.momentum_beta)
         self.state.lambda_previous = self.merger.lambda_previous
         self.state.lambda_current = updated
         self.state.omega = compute_omega(updated, self.omega_min, self.omega_max)
+        # 周期级快照跟着 epoch 级 λ 走：周期结束时它就是"该周期最后一刻的 λ"
+        self.lambda_cycle = updated
+        self.omega_cycle = compute_omega(updated, self.omega_min, self.omega_max)
         self.state.epochs.append(
             {
                 "epoch": epoch,
@@ -424,17 +464,23 @@ class JointAlignmentTrainer:
 
         self.finetune_round += 1
         round_index = self.finetune_round
+
+        # 冻结本周期的 λ / ω：式(7) 的 α 插值必须用"本轮 vs 上一轮"的值，
+        # 而不是"本 epoch vs 上一 epoch"的值（epoch 级 λ 变化太快，
+        # 会让 (1-α)λ_m + αλ_{m-1} 中的历史项失去"上一次合并时的强度"这一含义）。
+        lambda_cycle, omega_cycle = self.lambda_cycle, self.omega_cycle
+
         self.logger.info(
             f"===== LLM 微调第 {round_index}/{self.max_finetune_rounds} 轮"
-            f"（epoch {epoch}，ω={self.state.omega:.4f}）====="
+            f"（epoch {epoch}，周期 λ={lambda_cycle:.4f}，ω={omega_cycle:.4f}）====="
         )
 
         # ---- 1) 自举微调 ----
         finetune_info: Dict[str, Any] = {
             "round": round_index,
             "epoch": epoch,
-            "omega": round(self.state.omega, 6),
-            "lambda": round(self.state.lambda_current, 6),
+            "omega": round(omega_cycle, 6),
+            "lambda": round(lambda_cycle, 6),
             "num_records": 0,
             "adapter_dir": None,
         }
@@ -442,6 +488,11 @@ class JointAlignmentTrainer:
         if self.llm_backend is not None and getattr(self.llm_backend, "supports_finetuning", False):
             from src.llm.lora import build_finetune_records, finetune_and_export
 
+            if self.prompt_builder is None:
+                raise ValueError(
+                    "启用 LLM 微调时必须提供 prompt_builder：自举微调样本要求"
+                    "Prompt 与数据增强阶段完全一致（见 src/llm/lora.py 的说明）"
+                )
             records = build_finetune_records(
                 originals=self.train_originals,
                 augmented=[item for item in self.augmented_pool if item.augment_round == self.augment_round],
@@ -461,15 +512,13 @@ class JointAlignmentTrainer:
                 backend=self.llm_backend,
                 records=records,
                 output_dir=adapter_dir,
-                base_vector=self._base_vector,
+                reset_to_base=True,
                 logger=self.logger,
             )
             vector = result.get("vector")
             finetune_info["adapter_dir"] = result.get("path")
             finetune_info["vector_stats"] = result.get("stats", {})
-            if vector is not None:
-                # 记录累计基线，供下一轮做差分
-                self._base_vector = self._add_vectors(self._base_vector, vector)
+            finetune_info["reset_to_base"] = result.get("reset_to_base", False)
         else:
             self.logger.warning(
                 "当前 LLM 后端不支持梯度微调，跳过式(9) 的微调环节；"
@@ -478,8 +527,12 @@ class JointAlignmentTrainer:
 
         # ---- 2) TIES 合并（论文 Algorithm 1）----
         if vector is not None:
-            self.merger.add(vector, weight=self.state.omega, round_index=round_index)
+            self.merger.add(vector, weight=omega_cycle, round_index=round_index)
         merge_info = self.merge_and_apply(round_index, epoch)
+
+        # 周期推进：本轮的周期 λ 成为下一次合并的 λ_previous（式(7) 的历史项）
+        self.lambda_cycle_previous = lambda_cycle
+        self.merger.lambda_previous = lambda_cycle
 
         finetune_info["merge"] = merge_info
         self.state.finetune_rounds.append(finetune_info)
@@ -501,7 +554,13 @@ class JointAlignmentTrainer:
         return True
 
     def merge_and_apply(self, round_index: int, epoch: int) -> Dict[str, Any]:
-        """执行 Algorithm 1 并把合并结果写回 LLM。"""
+        """执行 Algorithm 1 并把合并结果写回 LLM。
+
+        缩放系数用**周期级**的 λ（:attr:`lambda_cycle` 与
+        :attr:`lambda_cycle_previous`），使式(7) 的
+        ``scaling = (1-α)·λ_m + α·λ_{m-1}`` 中的 ``λ_{m-1}`` 确实是
+        "上一次合并时的强度"，而不是上一个 epoch 的值。
+        """
         info: Dict[str, Any] = {"round": round_index, "epoch": epoch, "applied": False}
         if self.merger.task_vector.num_vectors == 0:
             self.logger.info("尚无任务向量，跳过 TIES 合并")
@@ -510,7 +569,18 @@ class JointAlignmentTrainer:
             self.logger.warning("当前后端不支持写回任务向量，跳过合并")
             return info
 
-        merged, report, scaling = self.merger.merge()
+        # 用周期级 λ 覆盖 merger 里的 epoch 级值，再执行合并
+        saved_current = self.merger.lambda_current
+        saved_previous = self.merger.lambda_previous
+        self.merger.lambda_current = self.lambda_cycle
+        self.merger.lambda_previous = self.lambda_cycle_previous
+        try:
+            merged, report, scaling = self.merger.merge()
+        finally:
+            # 合并完成后把 merger 的 λ 恢复为 epoch 级，继续给下一轮的式(8) 用
+            self.merger.lambda_current = saved_current
+            self.merger.lambda_previous = saved_previous
+
         self.llm_backend.apply_task_vector(merged, scaling=scaling)
         info.update(
             {
@@ -518,6 +588,8 @@ class JointAlignmentTrainer:
                 "scaling": round(float(scaling), 6),
                 "report": report.to_dict(),
                 "weights": [round(value, 6) for value in self.merger.task_vector.weights],
+                "lambda_cycle": round(self.lambda_cycle, 6),
+                "lambda_cycle_previous": round(self.lambda_cycle_previous, 6),
             }
         )
         self.state.merges.append(info)
@@ -531,7 +603,13 @@ class JointAlignmentTrainer:
 
     @staticmethod
     def _add_vectors(base: Optional[Mapping[str, Any]], delta: Mapping[str, Any]) -> Dict[str, Any]:
-        """累加任务向量（用于计算下一轮的差分基线）。"""
+        """累加任务向量（逐元素）。
+
+        保留这个工具是为了让"累计已写回的增量"这类诊断/消融可复用；
+        主流程**不再**用它做任务向量的基准对齐——那件事由
+        :func:`src.llm.lora.finetune_and_export` 的 ``reset_to_base`` 保证
+        （见该函数 docstring 里对"为什么不能用原始 τ 之和做差分"的说明）。
+        """
         if not base:
             return dict(delta)
         result: Dict[str, Any] = {}
@@ -556,9 +634,18 @@ class JointAlignmentTrainer:
     # ------------------------------------------------------------------ #
     # 训练入口
     # ------------------------------------------------------------------ #
-    def fit(self, train_originals: Sequence[DataInstance]) -> AlignmentState:
-        """执行完整的 Algorithm 2 流程并返回状态。"""
-        self.prepare(train_originals)
+    def fit(
+        self,
+        train_originals: Sequence[DataInstance],
+        existing_augmented: Optional[Sequence[DataInstance]] = None,
+    ) -> AlignmentState:
+        """执行完整的 Algorithm 2 流程并返回状态。
+
+        Args:
+            train_originals: 训练集原样本。
+            existing_augmented: 初始训练集里已经在用的磁盘增强样本（见 :meth:`prepare`）。
+        """
+        self.prepare(train_originals, existing_augmented=existing_augmented)
         self.logger.info(
             f"联合对齐开始：epochs={self.cl_trainer.epochs} "
             f"T(增强间隔)={self.augment_interval_epochs} "

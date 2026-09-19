@@ -315,7 +315,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ------------------------------------------------------------------ #
     # 5) 跑 Algorithm 2
     # ------------------------------------------------------------------ #
-    state = joint.fit(train_originals)
+    # existing_augmented 必须一并交给训练器：否则第一次重建训练集时，
+    # 这些"已经在训练集里用了"的磁盘增强样本会从训练集中静默消失。
+    state = joint.fit(train_originals, existing_augmented=existing_augmented)
 
     # ------------------------------------------------------------------ #
     # 6) 测试集评测
