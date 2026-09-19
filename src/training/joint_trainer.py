@@ -261,7 +261,7 @@ class JointAlignmentTrainer:
         # 2) 每 T 个 epoch 做一次数据增强
         augment_done = self.maybe_augment(epoch)
 
-        # 3) 每 T×? 个 epoch 做一次微调 + TIES 合并（含本轮增强）
+        # 3) 每 finetune_interval_epochs 个 epoch 做一次微调 + TIES 合并（含本轮增强）
         finetune_done = False
         if self.max_finetune_rounds > 0 and epoch % self.finetune_interval_epochs == 0:
             finetune_done = self.finetune_and_merge(epoch, augment_done)
@@ -487,7 +487,9 @@ class JointAlignmentTrainer:
         if self.reset_classifier_each_round:
             self.reset_classifier()
 
-        # 微调改变了 LLM，增强质量分布随之变化 → 数据重建 + 优化器重置
+        # 微调改变了 LLM，增强质量分布随之变化 → 重建训练集并重置优化器
+        # （只在这里重置：单轮纯增强不重置，否则每 T 个 epoch 就重新 warmup，
+        #   `training.cl.augment_every_epochs=1` 时等于每个 epoch 都重启学习率）
         self.rebuild_train_loader()
         self.cl_trainer.optimizer = None
         self.cl_trainer.scheduler = None

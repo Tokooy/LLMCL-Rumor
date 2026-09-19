@@ -201,7 +201,7 @@ def build_optimizer(
         named_parameters.append((f"projector.{name}", param))
     for name, param in model.classifier.named_parameters():
         named_parameters.append((f"classifier.{name}", param))
-    for name, param in model.encoder.named_parameters(prefix="encoder"):
+    for name, param in model.named_encoder_parameters(prefix="encoder.model"):
         named_parameters.append((name, param))
 
     no_decay = ("bias", "LayerNorm.weight", "layer_norm.weight", "ln_")
