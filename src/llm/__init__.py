@@ -18,6 +18,15 @@
 
 from .augmentor import AugmentationStats, Augmentor, dump_augmented, load_original_split
 from .base import GenerationResult, LLMBackend
+from .lora import (
+    build_finetune_record,
+    build_finetune_records,
+    describe_task_vector,
+    export_task_vector,
+    finetune_and_export,
+    load_task_vector,
+    save_task_vector,
+)
 from .parser import (
     QualityReport,
     build_quality_report,
@@ -28,6 +37,16 @@ from .parser import (
     word_overlap,
 )
 from .prompts import PromptBuilder, PromptSpec
+from .task_vector import TaskVector, subtract_parameters
+from .ties_merge import (
+    MergeReport,
+    TiesMerger,
+    disjoint_merge,
+    elect_sign,
+    merge_task_vectors,
+    resolve_scaling,
+    trim_task_vector,
+)
 from .factory import (
     BACKENDS,
     build_augmentor,
@@ -52,6 +71,22 @@ __all__ = [
     "merge_augmentation",
     "char_ngram_overlap",
     "word_overlap",
+    "TaskVector",
+    "subtract_parameters",
+    "trim_task_vector",
+    "elect_sign",
+    "disjoint_merge",
+    "merge_task_vectors",
+    "resolve_scaling",
+    "TiesMerger",
+    "MergeReport",
+    "build_finetune_record",
+    "build_finetune_records",
+    "export_task_vector",
+    "describe_task_vector",
+    "finetune_and_export",
+    "save_task_vector",
+    "load_task_vector",
     "BACKENDS",
     "build_backend",
     "build_prompt_builder",
