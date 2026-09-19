@@ -1,0 +1,22 @@
+# --------------------------------------------------------------------- #
+# Proposed-2：7B 基座，增强 2 轮（w=2），无微调（M=0）
+# 论文 Twitter15 ACC 78.45% / Twitter16 ACC 80.86%
+# --------------------------------------------------------------------- #
+defaults:
+  - ../llm/qwen7b.yaml
+
+experiment:
+  name: proposed-2
+  description: "7B, augmentation rounds w=2, fine-tuning rounds M=0"
+  llm_size: 7B
+  augment_rounds: 2
+  finetune_rounds: 0
+
+training:
+  cl:
+    epochs: 5
+    augment_every_epochs: 1
+  alignment:
+    enabled: false
+    max_augment_rounds: 2
+    max_finetune_rounds: 0

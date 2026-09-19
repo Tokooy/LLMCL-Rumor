@@ -1,0 +1,30 @@
+# --------------------------------------------------------------------- #
+# Proposed-6：13B 基座，增强 3 轮（w=3），微调 2 次（M=2，推定值）
+# 论文 Twitter15 ACC 81.81% / Twitter16 ACC 84.56%
+#
+# 论文只明确了"13B 基座 + 3 轮增强"；微调轮次在 docx 的勾选矩阵中无法可靠还原，
+# 这里按 Table 7/8 的趋势推定为 M=2，并已在 configs/experiments/README.md 标注。
+# 若只需复现"13B + 3 轮增强"这一确定结论，把 max_finetune_rounds 改成 0 即可。
+# --------------------------------------------------------------------- #
+defaults:
+  - ../llm/qwen13b.yaml
+
+experiment:
+  name: proposed-6
+  description: "13B, augmentation rounds w=3, fine-tuning rounds M=2 (inferred)"
+  llm_size: 13B
+  augment_rounds: 3
+  finetune_rounds: 2
+  notes: "论文仅明确 13B + 3 轮增强；M=2 为推定值"
+
+training:
+  cl:
+    epochs: 15
+    augment_every_epochs: 1
+  alignment:
+    enabled: true
+    max_augment_rounds: 3
+    max_finetune_rounds: 2
+    finetune_interval_epochs: 5
+    momentum_beta: 0.9
+    lambda_source: contrastive_accuracy

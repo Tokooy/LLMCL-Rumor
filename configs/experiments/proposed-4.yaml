@@ -1,0 +1,29 @@
+# --------------------------------------------------------------------- #
+# Proposed-4：7B 基座，增强 3 轮（w=3），微调 1 次（M=1）
+# 论文 Twitter15 ACC 80.13% / Twitter16 ACC 85.24%
+#
+# 与 Proposed-3 的唯一差别是 alignment.enabled=true 且 max_finetune_rounds=1：
+# 即论文 Algorithm 2 的"增强 3 轮 + 1 次 LLM 微调与 TIES 合并"。
+# --------------------------------------------------------------------- #
+defaults:
+  - ../llm/qwen7b.yaml
+
+experiment:
+  name: proposed-4
+  description: "7B, augmentation rounds w=3, fine-tuning rounds M=1"
+  llm_size: 7B
+  augment_rounds: 3
+  finetune_rounds: 1
+
+training:
+  cl:
+    epochs: 10
+    augment_every_epochs: 1
+  alignment:
+    enabled: true
+    max_augment_rounds: 3
+    max_finetune_rounds: 1
+    # 每 5 个 epoch 完成一次"增强 + 微调 + 合并"的完整对齐周期
+    finetune_interval_epochs: 5
+    momentum_beta: 0.9
+    lambda_source: contrastive_accuracy

@@ -1,0 +1,250 @@
+# ===================================================================== #
+# LLMCL-Rumor 基础配置
+# --------------------------------------------------------------------- #
+# 复现《基于LLM增强对比学习的社交网络虚假信息检测方法》(2025-01-22)。
+# 本文件是"默认超参总表"，实验配置（configs/experiments/*.yaml）只写差异项。
+#
+# 全部路径均相对仓库根目录；脚本请从仓库根目录执行。
+# ===================================================================== #
+
+project: LLMCL-Rumor
+seed: 42
+# 是否强制 cuDNN 确定性算法（复现优先时可开，但速度下降）
+deterministic: false
+
+paths:
+  data_dir: data
+  raw_dir: data/raw
+  processed_dir: data/processed
+  output_dir: outputs
+  checkpoint_dir: outputs/checkpoints
+  log_dir: outputs/logs
+  result_dir: outputs/results
+  figure_dir: outputs/figures
+
+device:
+  # 形如 "0 1" 或 "0"；空字符串表示使用全部可见 GPU / CPU
+  cuda_devices: "0"
+
+# --------------------------------------------------------------------- #
+# 数据
+# --------------------------------------------------------------------- #
+data:
+  name: twitter15
+  # text_mode: 如何把"原始帖子 + 关联回复"拼成编码器输入
+  #   source_only    仅原帖（对应图2中的 string_value 字段）
+  #   source_replies 原帖 + 展平后的回复（论文强调利用回复中的情绪与观点）
+  #   hierarchical   原帖 [SEP] 每条回复独立分段（仍为单序列 BERT，用段落标记区分）
+  text_mode: source_replies
+  max_seq_length: 128
+  # 回复展平时的遍历顺序：bfs（广度优先，贴近信息扩散的层次）/ dfs
+  reply_order: bfs
+  # 最多纳入多少条回复（控制序列长度；超出部分按 reply_order 截断）
+  max_replies: 20
+  # 训练时每个原始样本使用几份增强样本参与对比（w 轮增强后累计）
+  # 1 表示仅用最近一轮的增强；"all" 表示使用历史所有轮次的增强样本
+  augmented_per_sample: 1
+  use_augmented: true
+  # 数据划分比例（训练/验证/测试）；论文为 70% / 10% / 20%
+  split:
+    train: 0.7
+    dev: 0.1
+    test: 0.2
+    # 若原始数据自带官方划分，则优先使用官方划分
+    prefer_official_split: true
+
+# --------------------------------------------------------------------- #
+# 对比学习网络（CL 分类网络）
+# --------------------------------------------------------------------- #
+model:
+  # 句向量编码器：论文使用 BERT[27]
+  encoder:
+    name: bert-base-uncased
+    # 本地权重目录；留空则用 name 从 HuggingFace 下载
+    local_dir: ""
+    freeze_layers: 0        # >0 时冻结底部 N 层（论文为全量微调，默认 0）
+    gradient_checkpointing: false
+    do_lower_case: true
+
+  # 投影头：MLP，W1 -> 激活 -> W2（论文式(1)）
+  projector:
+    hidden_size: 768
+    output_size: 128
+    num_layers: 2
+    activation: relu         # relu / gelu / tanh
+    dropout: 0.1
+    normalize: true          # 输出 L2 归一化，等价于在单位球面上算余弦相似度
+
+  # 分类器：投影特征 -> C 个类别（论文：全连接 + softmax）
+  classifier:
+    dropout: 0.1
+    # true 时分类器接在投影特征上（论文式(4)的 z 维特征）
+    on_projection: true
+
+  # 对比损失（论文式(3)，InfoNCE[33]）
+  contrastive:
+    temperature: 0.07        # 论文中的温度超参数
+    # pairing: 正样本对的构造方式
+    #   paired    严格按论文：仅 (原样本 x_i, 其增强样本 x'_i) 互为正样本，
+    #             同一 batch 内其它样本（含同标签）全部视为负样本
+    #   supervised 有监督对比：同标签样本互为正样本，作为消融备选
+    pairing: paired
+    # 是否使用跨轮次的历史增强样本一起构造正样本对
+    use_history: false
+
+# --------------------------------------------------------------------- #
+# LLM（数据增强器 + 被微调对象）
+# --------------------------------------------------------------------- #
+# 该节可被 configs/llm/*.yaml 覆盖为 7B / 13B 两种基座
+llm:
+  # backend: transformers（本地权重，支持 LoRA 微调与 TIES 合并）
+  #          api（OpenAI 兼容接口，快速跑通；不支持梯度微调，微调轮次自动跳过）
+  backend: transformers
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  local_dir: ""
+  load_in_8bit: false
+  torch_dtype: bfloat16
+  device_map: auto
+  trust_remote_code: true
+  max_new_tokens: 1024
+
+  # api 后端参数（backend=api 时生效）
+  api:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    model: qwen2.5-7b-instruct
+    timeout: 120
+    max_retries: 3
+    concurrency: 4
+    extra_body: {}
+
+  prompt:
+    template_file: configs/prompts/augment_default.txt
+    # 四类标签对应的自然语言描述，供 Prompt 约束"语义一致"
+    label_descriptions:
+      NR: non-rumor (verified truthful information)
+      FR: false rumor (verified as false information)
+      TR: true rumor (verified as true information)
+      UR: unverified rumor (truthfulness not yet determined)
+
+  generation:
+    temperature: 0.9         # 多样性目标；同一轮内不做贪心解码
+    top_p: 0.9
+    top_k: 50
+    repetition_penalty: 1.05
+    do_sample: true
+    seed: 42
+
+  augmentation:
+    # 每个原始样本生成几份增强样本（论文图4显示"一条原始 -> 一条增强"的配对；
+    # 设为 1 即严格配对，设为 >1 时加强多样性但会改变正样本对数量）
+    copies_per_sample: 1
+    # 是否要求 LLM 输出的增强样本与原样本结构完全一致（论文"输出格式一致"目标）
+    strict_format: true
+    # 失败样本的最大重试次数（JSON 解析失败 / 字段缺失）
+    max_retries: 3
+    # 缓存目录：同一样本 + 同一 prompt + 同一模型只调用一次 LLM
+    cache_dir: outputs/cache/augmentation
+    # 并发请求数（api 后端）/ 本地批大小（transformers 后端）
+    batch_size: 4
+    # 每条样本的增强温度抖动范围，避免整批增强"同质化"
+    temperature_jitter: 0.05
+
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    # 目标模块留空时按模型族自动推断（Qwen: q/k/v/o/gate/up/down_proj）
+    target_modules: []
+    bias: none
+    learning_rate: 0.0001
+    epochs: 1
+    batch_size: 1
+    gradient_accumulation_steps: 8
+    max_seq_length: 1024
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    # 微调样本来源：bootstrap（论文：用 LLM 自己产出的增强数据自举微调）
+    train_source: bootstrap
+
+  # TIES-Merging 任务向量合并（论文 Algorithm 1 + 文献[35]）
+  merge:
+    trim_percent: 20         # q：只保留幅值前 q% 的参数，其余置 0
+    scaling_alpha: 0.5       # α：合并超参数；θ_final = (1-α)·θ̃ + α·θ_prev
+    # 是否把多轮任务向量一起合并（论文 Algorithm 1 的 (τ1..τm) 形态）
+    merge_all_checkpoints: true
+
+# --------------------------------------------------------------------- #
+# 训练
+# --------------------------------------------------------------------- #
+training:
+  # ---- 对比学习阶段（CL 分类网络）----
+  cl:
+    epochs: 5                # N：CL 训练总 epoch 数
+    batch_size: 32
+    eval_batch_size: 64
+    learning_rate: 0.00002
+    weight_decay: 0.01
+    adam_epsilon: 0.00000001
+    warmup_proportion: 0.1
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 1
+    # 每 T 个 epoch 触发一次 LLM 数据增强（论文：每 T 轮增强一次）
+    augment_every_epochs: 1
+    # 损失 = ce_weight * 交叉熵 + cl_weight * InfoNCE
+    ce_weight: 1.0
+    cl_weight: 1.0
+    # 分类器是否直接参与对比损失（论文将两者联合优化）
+    joint_objective: true
+    evaluate_every_epochs: 1
+    save_best_on: avg_f1     # acc / avg_f1
+    early_stop_patience: 10
+    log_every_steps: 50
+    num_workers: 0
+    pin_memory: true
+
+  # ---- LLM 与 CL 的对齐阶段（论文 Algorithm 2）----
+  alignment:
+    enabled: true
+    # M：最大微调轮次（论文 Proposed-1..3 为 0，Proposed-4 为 1，Proposed-5 为 2）
+    max_finetune_rounds: 0
+    # w：数据增强轮次上限（论文 1..3）
+    max_augment_rounds: 3
+    # 每 T 个 epoch 执行一次增强（见 training.cl.augment_every_epochs 的同名说明）
+    augment_interval_epochs: 1
+    # 每多少个 epoch 完成一次"数据增强 + 微调"的完整对齐周期
+    finetune_interval_epochs: 5
+    # λ 的动量系数（论文式(8)的 β）
+    momentum_beta: 0.9
+    lambda_init: 1.0
+    # λ 的定义口径：
+    #   contrastive_accuracy  λ = dev 上 CL 分类准确率的动量平滑（默认）
+    #   inverse_loss          λ = 1/(1+CL loss) 的动量平滑（论文只写了"CL 性能指标"）
+    lambda_source: contrastive_accuracy
+    # 权重 ω_m = f(λ)（论文式(9)）；clip 到 [omega_min, omega_max]
+    omega_min: 0.05
+    omega_max: 0.95
+    # 每个对齐周期结束后是否重新初始化 CL 分类头
+    reset_classifier_each_round: false
+    # 达到 max_finetune_rounds 后是否停止（论文 Algorithm 2 第 10-15 行）
+    stop_when_max_reached: false
+
+# --------------------------------------------------------------------- #
+# 评估与可视化
+# --------------------------------------------------------------------- #
+evaluation:
+  metrics: [acc, precision, recall, f1, avg_f1]
+  # 论文 Table 1：Twitter15/16 的四个类别
+  report_per_class: true
+  save_predictions: true
+
+visualization:
+  # 对应论文 Fg.7 ~ Fg.10 的特征分布图
+  tsne:
+    enabled: true
+    perplexity: 30
+    n_iter: 1000
+    sample_size: 0     # 0 表示使用全部测试样本
+    seed: 42
+  log_tensorboard: true

@@ -1,0 +1,29 @@
+# ===================================================================== #
+# 基座 LLM：Qwen2.5-13B-Instruct（论文 Proposed-6，用于探索性能上限）
+# --------------------------------------------------------------------- #
+# 论文："13B 的模型引入了三轮增强（Proposed-6），以探索性能上限"。
+# 13B 需要约 26GB bf16 显存，单卡 24GB(4090) 需开启 load_in_8bit 或使用双卡。
+# ===================================================================== #
+
+defaults:
+  - ../base.yaml
+
+llm:
+  backend: transformers
+  model_name: Qwen/Qwen2.5-13B-Instruct
+  local_dir: ""
+  torch_dtype: bfloat16
+  device_map: auto
+  max_new_tokens: 1024
+  # 单张 24GB 显卡跑 13B 时打开量化（会略微影响增强质量，需在论文中说明）
+  load_in_8bit: false
+
+  augmentation:
+    copies_per_sample: 1
+    batch_size: 2
+
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    learning_rate: 0.0001

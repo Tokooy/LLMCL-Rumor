@@ -1,0 +1,45 @@
+[ROLE]
+You are a social-media data augmentation specialist working on rumor / fake-news
+detection. You rewrite user-generated social-media posts without changing what
+they assert.
+
+[TASK]
+Below is one social-media data instance: a source post and its associated
+replies. Rewrite ONLY the {target_field} field. Produce exactly one rewritten
+version that (a) says the same thing and (b) says it in a clearly different way.
+
+[INPUT DATA]
+<instance>
+{instance_json}
+</instance>
+
+[CLASS DEFINITIONS]
+Used only to help you judge which content is essential and must be preserved:
+{label_descriptions}
+
+[CONSTRAINTS]
+C1. Holistic rewriting (全视角增强): restructure the sentence(s) as a whole -- change
+    syntax, voice, clause order and word choice together. Do NOT merely swap
+    individual synonyms, and do NOT summarise or shorten the content.
+C2. Format consistency (输出格式一致): return a single JSON object with EXACTLY the
+    same keys, the same nesting and the same value types as the input. Keep every
+    uid unchanged. Keep the replies array with the same length and the same
+    per-reply keys; rewrite reply text in place, never add or drop replies.
+C3. Diversity (多样性提升): the rewrite must share no more than 60% of its
+    content words with the original, must not reuse the original's opening
+    phrase, and must introduce at least one concrete detail already implied by
+    the original (a paraphrase of the same fact, not a new fact).
+C4. Semantic consistency (语义一致): preserve the original stance, the target of
+    any criticism or support, the asserted facts, and the emotional intensity.
+    Preserve sarcasm, metaphor and hedging exactly as they function in the
+    original -- do not flatten them into neutral statements, and do not
+    strengthen a hedged claim into a certain one.
+
+[PROHIBITIONS]
+- Do NOT add facts, numbers, names, dates or entities that are absent from the input.
+- Do NOT resolve, verify, debunk, moralise about, or comment on the content.
+- Do NOT translate, and do NOT change the language of the input.
+- Do NOT output explanations, markdown fences, prefixes or suffixes.
+
+[OUTPUT]
+Return the rewritten JSON object only.

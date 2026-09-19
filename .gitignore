@@ -1,0 +1,57 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 数据集（体积大且受 Twitter 服务条款约束，不入库）----
+data/raw/
+data/processed/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# ---- 训练产物 ----
+outputs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+runs/
+wandb/
+
+# ---- LLM 权重与增强缓存 ----
+models/
+checkpoints/
+*.gguf
+
+# ---- 日志与临时文件 ----
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# ---- 密钥 ----
+.env
+.env.*
+*.key
+*.pem
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

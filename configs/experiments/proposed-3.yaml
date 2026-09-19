@@ -1,0 +1,23 @@
+# --------------------------------------------------------------------- #
+# Proposed-3：7B 基座，增强 3 轮（w=3），无微调（M=0）
+# 论文 Twitter15 ACC 79.12% / Twitter16 ACC 83.33%
+# 这是 Table 7/8 中"不同微调轮次"对照组的基线。
+# --------------------------------------------------------------------- #
+defaults:
+  - ../llm/qwen7b.yaml
+
+experiment:
+  name: proposed-3
+  description: "7B, augmentation rounds w=3, fine-tuning rounds M=0"
+  llm_size: 7B
+  augment_rounds: 3
+  finetune_rounds: 0
+
+training:
+  cl:
+    epochs: 5
+    augment_every_epochs: 1
+  alignment:
+    enabled: false
+    max_augment_rounds: 3
+    max_finetune_rounds: 0
